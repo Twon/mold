@@ -1,0 +1,15 @@
+target_sources(mold
+    PRIVATE
+        cmdline.cc
+        dumper.cc
+        input-sections.cc
+        macho.h
+        main.cc
+        mapfile.cc
+        mold.h
+        object-file.cc
+        output-chunks.cc
+        output-file.cc
+        tapi.cc
+        yaml.cc
+)
