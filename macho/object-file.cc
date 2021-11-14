@@ -23,75 +23,194 @@ ObjectFile *ObjectFile::create(Context &ctx, MappedFile<Context> *mf,
 };
 
 void ObjectFile::parse(Context &ctx) {
-  MachHeader &hdr = *(MachHeader *)mf->data;
-  u8 *p = mf->data + sizeof(hdr);
+  parse_sections(ctx);
+  parse_symtab(ctx);
+  split_subsections(ctx);
+  parse_data_in_code(ctx);
 
-  MachSection *unwind_sec = nullptr;
-
-  for (i64 i = 0; i < hdr.ncmds; i++) {
-    LoadCommand &lc = *(LoadCommand *)p;
-
-    switch (lc.cmd) {
-    case LC_SEGMENT_64: {
-      SegmentCommand &cmd = *(SegmentCommand *)p;
-      MachSection *mach_sec = (MachSection *)(p + sizeof(cmd));
-
-      for (i64 i = 0; i < cmd.nsects; i++) {
-        if (mach_sec[i].get_segname() == "__LD" &&
-            mach_sec[i].get_sectname() == "__compact_unwind") {
-          unwind_sec = &mach_sec[i];
-        } else {
-          sections.push_back(
-            std::make_unique<InputSection>(ctx, *this, mach_sec[i]));
-        }
-      }
-      break;
-    }
-    case LC_SYMTAB: {
-      SymtabCommand &cmd = *(SymtabCommand *)p;
-      mach_syms = {(MachSym *)(mf->data + cmd.symoff), cmd.nsyms};
-      syms.reserve(mach_syms.size());
-
-      i64 nlocal = 0;
-      for (MachSym &msym : mach_syms)
-        if (!msym.ext)
-          nlocal++;
-      local_syms.reserve(nlocal);
-
-      for (MachSym &msym : mach_syms) {
-        std::string_view name = (char *)(mf->data + cmd.stroff + msym.stroff);
-        if (msym.ext) {
-          syms.push_back(intern(ctx, name));
-        } else {
-          local_syms.emplace_back(name);
-          override_symbol(ctx, local_syms.back(), msym);
-          syms.push_back(&local_syms.back());
-        }
-      }
-      break;
-    }
-    case LC_DYSYMTAB:
-    case LC_BUILD_VERSION:
-    case LC_VERSION_MIN_MACOSX:
-      break;
-    case LC_DATA_IN_CODE: {
-      LinkEditDataCommand &cmd = *(LinkEditDataCommand *)p;
-      data_in_code_entries = {(DataInCodeEntry *)(mf->data + cmd.dataoff),
-                              cmd.datasize / sizeof(DataInCodeEntry)};
-      break;
-    }
-    default:
-      Error(ctx) << *this << ": unknown load command: 0x" << std::hex << lc.cmd;
-    }
-
-    p += lc.cmdsize;
-  }
-
-  for (std::unique_ptr<InputSection> &sec : sections)
-    sec->parse_relocations(ctx);
+  for (std::unique_ptr<InputSection> &isec : sections)
+    if (isec)
+      isec->parse_relocations(ctx);
 
   if (unwind_sec)
     parse_compact_unwind(ctx, *unwind_sec);
+}
+
+void ObjectFile::parse_sections(Context &ctx) {
+  MachHeader &hdr = *(MachHeader *)mf->data;
+  u8 *p = mf->data + sizeof(hdr);
+
+  // Read all but a symtab section
+  for (i64 i = 0; i < hdr.ncmds; i++) {
+    LoadCommand &lc = *(LoadCommand *)p;
+    p += lc.cmdsize;
+    if (lc.cmd != LC_SEGMENT_64)
+      continue;
+
+    SegmentCommand &cmd = *(SegmentCommand *)&lc;
+    MachSection *mach_sec = (MachSection *)((u8 *)&lc + sizeof(cmd));
+
+    for (MachSection &msec : std::span(mach_sec, mach_sec + cmd.nsects)) {
+      sections.push_back(nullptr);
+
+      if (msec.match("__LD", "__compact_unwind")) {
+        unwind_sec = &msec;
+        continue;
+      }
+
+      if (msec.attr & S_ATTR_DEBUG)
+        continue;
+
+      sections.back().reset(new InputSection(ctx, *this, msec));
+    }
+  }
+}
+
+void ObjectFile::parse_symtab(Context &ctx) {
+  SymtabCommand *cmd = (SymtabCommand *)find_load_command(ctx, LC_SYMTAB);
+  if (!cmd)
+    return;
+
+  mach_syms = {(MachSym *)(mf->data + cmd->symoff), cmd->nsyms};
+  syms.reserve(mach_syms.size());
+
+  i64 nlocal = 0;
+  for (MachSym &msym : mach_syms)
+    if (!msym.ext)
+      nlocal++;
+  local_syms.reserve(nlocal);
+
+  for (MachSym &msym : mach_syms) {
+    std::string_view name = (char *)(mf->data + cmd->stroff + msym.stroff);
+
+    if (msym.ext) {
+      syms.push_back(intern(ctx, name));
+    } else {
+      local_syms.emplace_back(name);
+      syms.push_back(&local_syms.back());
+    }
+  }
+}
+
+void ObjectFile::split_subsections(Context &ctx) {
+  sym_to_subsec.resize(mach_syms.size());
+
+  struct Entry {
+    u32 offset;
+    u32 idx : 31;
+    u32 is_alt_entry : 1;
+  };
+
+  struct Section {
+    InputSection *isec = nullptr;
+    std::vector<Entry> syms;
+  };
+
+  std::vector<Section> entries(sections.size());
+  for (i64 i = 0; i < sections.size(); i++)
+    if (sections[i])
+      entries[i].isec = sections[i].get();
+
+  for (i64 i = 0; i < mach_syms.size(); i++) {
+    MachSym &msym = mach_syms[i];
+    if (msym.type == N_SECT) {
+      Entry loc;
+      loc.offset = msym.value - sections[msym.sect - 1]->hdr.addr;
+      loc.idx = i;
+      loc.is_alt_entry = (msym.desc & N_ALT_ENTRY);
+      entries[msym.sect - 1].syms.push_back(loc);
+    }
+  }
+
+  erase(entries, [](const Section &ent) { return !ent.isec; });
+
+  sort(entries, [](const Section &a, const Section &b) {
+    return a.isec->hdr.addr < b.isec->hdr.addr;
+  });
+
+  for (Section &ent :entries) {
+    sort(ent.syms, [](const Entry &a, const Entry &b) {
+      return a.offset < b.offset;
+    });
+  }
+
+  for (Section &ent :entries) {
+    InputSection &isec = *ent.isec;
+
+    if (ent.syms.empty()) {
+      Subsection *subsec = new Subsection{
+        .isec = isec,
+        .input_offset = 0,
+        .input_size = (u32)isec.hdr.size,
+        .input_addr = (u32)isec.hdr.addr,
+        .p2align = (u8)isec.hdr.p2align,
+      };
+      subsections.push_back(std::unique_ptr<Subsection>(subsec));
+      continue;
+    }
+
+    i64 size = subsections.size();
+
+    for (Entry &loc : ent.syms) {
+      if (!loc.is_alt_entry) {
+        Subsection *subsec = new Subsection{
+          .isec = isec,
+          .input_offset = loc.offset,
+          .input_addr = (u32)(isec.hdr.addr + loc.offset),
+          .p2align = (u8)isec.hdr.p2align,
+        };
+        subsections.push_back(std::unique_ptr<Subsection>(subsec));
+      }
+      sym_to_subsec[loc.idx] = subsections.size() - 1;
+    }
+
+    for (i64 j = size; j < subsections.size() - 1; j++) {
+      subsections[j]->input_size =
+        subsections[j + 1]->input_offset - subsections[j]->input_offset;
+    }
+    subsections.back()->input_size =
+      isec.hdr.size - subsections.back()->input_offset;
+  }
+
+  for (i64 i = 0; i < mach_syms.size(); i++)
+    if (!mach_syms[i].ext)
+      override_symbol(ctx, i);
+}
+
+void ObjectFile::parse_data_in_code(Context &ctx) {
+  if (auto *cmd = (LinkEditDataCommand *)find_load_command(ctx, LC_DATA_IN_CODE))
+    data_in_code_entries = {(DataInCodeEntry *)(mf->data + cmd->dataoff),
+                            cmd->datasize / sizeof(DataInCodeEntry)};
+}
+
+LoadCommand *ObjectFile::find_load_command(Context &ctx, u32 type) {
+  MachHeader &hdr = *(MachHeader *)mf->data;
+  u8 *p = mf->data + sizeof(hdr);
+
+  for (i64 i = 0; i < hdr.ncmds; i++) {
+    LoadCommand &lc = *(LoadCommand *)p;
+    if (lc.cmd == type)
+      return &lc;
+    p += lc.cmdsize;
+  }
+  return nullptr;
+}
+
+i64 ObjectFile::find_subsection_idx(Context &ctx, u32 addr) {
+  auto it = std::upper_bound(
+      subsections.begin(), subsections.end(), addr,
+      [&](u32 addr, const std::unique_ptr<Subsection> &subsec) {
+    return addr < subsec->input_addr;
+  });
+
+  if (it == subsections.begin())
+    return -1;
+  return it - subsections.begin() - 1;
+}
+
+Subsection *ObjectFile::find_subsection(Context &ctx, u32 addr) {
+  i64 i = find_subsection_idx(ctx, addr);
+  return (i == -1) ? nullptr : subsections[i].get();
 }
 
 void ObjectFile::parse_compact_unwind(Context &ctx, MachSection &hdr) {
@@ -126,11 +245,9 @@ void ObjectFile::parse_compact_unwind(Context &ctx, MachSection &hdr) {
       if (r.is_pcrel || r.p2size != 3 || r.is_extern || r.type)
         error();
 
-      Subsection *target =
-        sections[r.idx - 1]->find_subsection(ctx, src[idx].code_start);
+      Subsection *target = find_subsection(ctx, src[idx].code_start);
       if (!target)
         error();
-
       dst.subsec = target;
       dst.offset = src[idx].code_start - target->input_addr;
       break;
@@ -145,8 +262,11 @@ void ObjectFile::parse_compact_unwind(Context &ctx, MachSection &hdr) {
         error();
 
       i32 addr = *(i32 *)((u8 *)mf->data + hdr.offset + r.offset);
-      dst.lsda = sections[r.idx - 1]->find_subsection(ctx, addr);
-      dst.lsda_offset = addr - dst.lsda->input_addr;
+      Subsection *target = find_subsection(ctx, addr);
+      if (!target)
+        error();
+      dst.lsda = target;
+      dst.lsda_offset = addr - target->input_addr;
       break;
     }
     default:
@@ -212,7 +332,10 @@ static u64 get_rank(Symbol &sym) {
   return (1 << 24) + file->priority;
 }
 
-void ObjectFile::override_symbol(Context &ctx, Symbol &sym, MachSym &msym) {
+void ObjectFile::override_symbol(Context &ctx, i64 idx) {
+  Symbol &sym = *syms[idx];
+  MachSym &msym = mach_syms[idx];
+
   sym.file = this;
   sym.is_extern = msym.ext;
   sym.is_lazy = false;
@@ -230,7 +353,7 @@ void ObjectFile::override_symbol(Context &ctx, Symbol &sym, MachSym &msym) {
     sym.is_common = false;
     break;
   case N_SECT:
-    sym.subsec = sections[msym.sect - 1]->find_subsection(ctx, msym.value);
+    sym.subsec = subsections[sym_to_subsec[idx]].get();
     sym.value = msym.value - sym.subsec->input_addr;
     sym.is_common = false;
     break;
@@ -248,7 +371,7 @@ void ObjectFile::resolve_regular_symbols(Context &ctx) {
     Symbol &sym = *syms[i];
     std::lock_guard lock(sym.mu);
     if (get_rank(this, msym, false) < get_rank(sym))
-      override_symbol(ctx, sym, msym);
+      override_symbol(ctx, i);
   }
 }
 
@@ -291,7 +414,7 @@ std::vector<ObjectFile *> ObjectFile::mark_live_objects(Context &ctx) {
     }
 
     if (get_rank(this, msym, false) < get_rank(sym))
-      override_symbol(ctx, sym, msym);
+      override_symbol(ctx, i);
   }
   return vec;
 }
@@ -309,12 +432,23 @@ void ObjectFile::convert_common_symbols(Context &ctx) {
         .p2align = (u8)msym.p2align,
       };
 
-      isec->subsections.push_back(std::unique_ptr<Subsection>(subsec));
+      subsections.push_back(std::unique_ptr<Subsection>(subsec));
+
       sym.subsec = subsec;
       sym.value = 0;
       sym.is_common = false;
     }
-  }  
+  }
+}
+
+void ObjectFile::check_duplicate_symbols(Context &ctx) {
+  for (i64 i = 0; i < syms.size(); i++) {
+    Symbol *sym = syms[i];
+    MachSym &msym = mach_syms[i];
+    if (sym && !msym.is_undef() && !msym.is_common() && sym->file != this)
+      Error(ctx) << "duplicate symbol: " << *this << ": " << *sym->file
+                 << ": " << *sym;
+  }
 }
 
 InputSection *ObjectFile::get_common_sec(Context &ctx) {
@@ -344,10 +478,18 @@ void DylibFile::read_trie(Context &ctx, u8 *start, i64 offset,
                           const std::string &prefix) {
   u8 *buf = start + offset;
 
-  if (read_uleb(buf))
+  if (*buf) {
+    read_uleb(buf); // size
+    read_uleb(buf); // flags
+    read_uleb(buf); // addr
     syms.push_back(intern(ctx, prefix));
+  } else {
+    buf++;
+  }
 
-  for (i64 i = 0, end = read_uleb(buf); i < end; i++) {
+  i64 nchild = *buf++;
+
+  for (i64 i = 0; i < nchild; i++) {
     std::string suffix((char *)buf);
     buf += suffix.size() + 1;
     i64 off = read_uleb(buf);

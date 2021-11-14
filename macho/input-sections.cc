@@ -15,28 +15,6 @@ InputSection::InputSection(Context &ctx, ObjectFile &file, const MachSection &hd
     osec(*OutputSection::get_instance(ctx, hdr.get_segname(), hdr.get_sectname())) {
   if (hdr.type != S_ZEROFILL)
     contents = file.mf->get_contents().substr(hdr.offset, hdr.size);
-
-  Subsection *subsec = new Subsection{
-    .isec = *this,
-    .input_offset = 0,
-    .input_size = (u32)hdr.size,
-    .input_addr = (u32)hdr.addr,
-    .p2align = (u8)hdr.p2align,
-  };
-
-  subsections.push_back(std::unique_ptr<Subsection>(subsec));
-}
-
-Subsection *InputSection::find_subsection(Context &ctx, u32 addr) {
-  auto it = std::upper_bound(subsections.begin(), subsections.end(), addr,
-                             [&](u32 addr,
-                                 const std::unique_ptr<Subsection> &subsec) {
-    return addr < subsec->input_addr;
-  });
-
-  if (it == subsections.begin())
-    return nullptr;
-  return it[-1].get();
 }
 
 static i64 read_addend(u8 *buf, MachRel r) {
@@ -89,7 +67,7 @@ static Relocation read_reloc(Context &ctx, ObjectFile &file,
     addr = addend;
   }
 
-  Subsection *target = file.sections[r.idx - 1]->find_subsection(ctx, addr);
+  Subsection *target = file.find_subsection(ctx, addr);
   if (!target)
     Fatal(ctx) << file << ": bad relocation: " << r.offset;
 
@@ -111,25 +89,53 @@ void InputSection::parse_relocations(Context &ctx) {
     return a.offset < b.offset;
   });
 
+  // Find subsections for this section
+  auto begin = std::lower_bound(
+      file.subsections.begin(), file.subsections.end(), hdr.addr,
+      [](std::unique_ptr<Subsection> &subsec, u32 addr) {
+    return subsec->input_addr < addr;
+  });
+
+  auto end = std::upper_bound(
+      begin, file.subsections.end(), hdr.addr,
+      [](u32 addr, std::unique_ptr<Subsection> &subsec) {
+    return subsec->input_addr + subsec->input_size <= addr;
+  });
+
   // Assign each subsection a group of relocations
   i64 i = 0;
-  for (std::unique_ptr<Subsection> &subsec : subsections) {
-    subsec->rel_offset = i;
+  for (auto it = begin; it < end; it++) {
+    Subsection &subsec = **it;
+    subsec.rel_offset = i;
     while (i < rels.size() &&
-           rels[i].offset < subsec->input_offset + subsec->input_size)
+           rels[i].offset < subsec.input_offset + subsec.input_size) {
+      rels[i].offset -= subsec.input_offset;
       i++;
-    subsec->nrels = i - subsec->rel_offset;
+    }
+    subsec.nrels = i - subsec.rel_offset;
   }
 }
 
-void InputSection::scan_relocations(Context &ctx) {
-  for (Relocation &rel : rels) {
-    if (Symbol *sym = rel.sym) {
-      if (rel.type == X86_64_RELOC_GOT_LOAD || rel.type == X86_64_RELOC_GOT)
+void Subsection::scan_relocations(Context &ctx) {
+  for (Relocation &rel : get_rels()) {
+    Symbol *sym = rel.sym;
+    if (!sym)
+      continue;
+
+    switch (rel.type) {
+    case X86_64_RELOC_GOT_LOAD:
+    case X86_64_RELOC_GOT:
+      if (sym->file->is_dylib)
         sym->flags |= NEEDS_GOT;
-      if (sym->file && sym->file->is_dylib)
-        sym->flags |= NEEDS_STUB;
+      break;
+    case X86_64_RELOC_TLV:
+      if (sym->file->is_dylib)
+        sym->flags |= NEEDS_THREAD_PTR;
+      break;
     }
+
+    if (sym->file && sym->file->is_dylib)
+      sym->flags |= NEEDS_STUB;
   }
 }
 
@@ -152,8 +158,29 @@ void Subsection::apply_reloc(Context &ctx, u8 *buf) {
       val = rel.sym ? rel.sym->get_addr(ctx) : rel.subsec->get_addr(ctx);
       break;
     case X86_64_RELOC_GOT_LOAD:
+      if (rel.sym->got_idx != -1) {
+        val = rel.sym->get_got_addr(ctx);
+      } else {
+        // Relax MOVQ into LEAQ
+        if (buf[rel.offset - 2] != 0x8b)
+          Error(ctx) << isec << ": invalid GOT_LOAD relocation";
+        buf[rel.offset - 2] = 0x8d;
+        val = rel.sym->get_addr(ctx);
+      }
+      break;
     case X86_64_RELOC_GOT:
       val = rel.sym->get_got_addr(ctx);
+      break;
+    case X86_64_RELOC_TLV:
+      if (rel.sym->tlv_idx != -1) {
+        val = rel.sym->get_tlv_addr(ctx);
+      } else {
+        // Relax MOVQ into LEAQ
+        if (buf[rel.offset - 2] != 0x8b)
+          Error(ctx) << isec << ": invalid TLV relocation";
+        buf[rel.offset - 2] = 0x8d;
+        val = rel.sym->get_addr(ctx);
+      }
       break;
     default:
       Fatal(ctx) << isec << ": unknown reloc: " << (int)rel.type;

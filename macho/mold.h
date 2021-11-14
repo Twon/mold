@@ -13,7 +13,6 @@
 namespace mold::macho {
 
 static constexpr i64 PAGE_SIZE = 0x4000;
-static constexpr i64 PAGE_ZERO_SIZE = 0x100000000;
 static constexpr i64 SHA256_SIZE = 32;
 
 class Chunk;
@@ -49,6 +48,7 @@ struct UnwindRecord {
   Symbol *personality = nullptr;
   Subsection *lsda = nullptr;
   u32 lsda_offset = 0;
+  bool is_alive = false;
 };
 
 class InputFile {
@@ -71,24 +71,35 @@ public:
   static ObjectFile *create(Context &ctx, MappedFile<Context> *mf,
                             std::string archive_name);
   void parse(Context &ctx);
+  Subsection *find_subsection(Context &ctx, u32 addr);
   void parse_compact_unwind(Context &ctx, MachSection &hdr);
   void resolve_regular_symbols(Context &ctx);
   void resolve_lazy_symbols(Context &ctx);
   std::vector<ObjectFile *> mark_live_objects(Context &ctx);
   void convert_common_symbols(Context &ctx);
+  void check_duplicate_symbols(Context &ctx);
 
   Relocation read_reloc(Context &ctx, const MachSection &hdr, MachRel r);
 
   std::vector<std::unique_ptr<InputSection>> sections;
+  std::vector<std::unique_ptr<Subsection>> subsections;
+  std::vector<u32> sym_to_subsec;
   std::span<MachSym> mach_syms;
   std::vector<Symbol> local_syms;
   std::vector<UnwindRecord> unwind_records;
   std::span<DataInCodeEntry> data_in_code_entries;
 
 private:
-  void override_symbol(Context &ctx, Symbol &sym, MachSym &msym);
+  void parse_sections(Context &ctx);
+  void parse_symtab(Context &ctx);
+  void split_subsections(Context &ctx);
+  void parse_data_in_code(Context &ctx);
+  LoadCommand *find_load_command(Context &ctx, u32 type);
+  i64 find_subsection_idx(Context &ctx, u32 addr);
+  void override_symbol(Context &ctx, i64 symidx);
   InputSection *get_common_sec(Context &ctx);
 
+  MachSection *unwind_sec = nullptr;
   std::unique_ptr<MachSection> common_hdr;
   InputSection *common_sec = nullptr;
 };
@@ -123,14 +134,12 @@ class InputSection {
 public:
   InputSection(Context &ctx, ObjectFile &file, const MachSection &hdr);
   void parse_relocations(Context &ctx);
-  Subsection *find_subsection(Context &ctx, u32 addr);
-  void scan_relocations(Context &ctx);
 
   ObjectFile &file;
   const MachSection &hdr;
   OutputSection &osec;
   std::string_view contents;
-  std::vector<std::unique_ptr<Subsection>> subsections;
+  std::vector<Symbol *> syms;
   std::vector<Relocation> rels;
 };
 
@@ -138,9 +147,7 @@ std::ostream &operator<<(std::ostream &out, const InputSection &sec);
 
 class Subsection {
 public:
-  u64 get_addr(Context &ctx) const {
-    return PAGE_ZERO_SIZE + raddr;
-  }
+  inline u64 get_addr(Context &ctx) const;
 
   std::string_view get_contents() {
     assert(isec.hdr.type != S_ZEROFILL);
@@ -155,6 +162,7 @@ public:
     return std::span(isec.rels).subspan(rel_offset, nrels);
   }
 
+  void scan_relocations(Context &ctx);
   void apply_reloc(Context &ctx, u8 *buf);
 
   InputSection &isec;
@@ -167,6 +175,7 @@ public:
   u32 nunwind = 0;
   u32 raddr = -1;
   u16 p2align = 0;
+  std::atomic_bool is_alive = false;
 };
 
 //
@@ -174,8 +183,9 @@ public:
 //
 
 enum {
-  NEEDS_GOT  = 1 << 0,
-  NEEDS_STUB = 1 << 1,
+  NEEDS_GOT        = 1 << 0,
+  NEEDS_STUB       = 1 << 1,
+  NEEDS_THREAD_PTR = 1 << 2,
 };
 
 struct Symbol {
@@ -190,6 +200,7 @@ struct Symbol {
 
   i32 stub_idx = -1;
   i32 got_idx = -1;
+  i32 tlv_idx = -1;
 
   tbb::spin_mutex mu;
 
@@ -202,6 +213,7 @@ struct Symbol {
 
   inline u64 get_addr(Context &ctx) const;
   inline u64 get_got_addr(Context &ctx) const;
+  inline u64 get_tlv_addr(Context &ctx) const;
 };
 
 std::ostream &operator<<(std::ostream &out, const Symbol &sym);
@@ -441,7 +453,7 @@ public:
   void compute_size(Context &ctx) override;
   void copy_buf(Context &ctx) override;
 
-  std::string contents{"\0"};
+  std::string contents{1, '\0'};
 };
 
 class OutputIndirectSymtabSection : public Chunk {
@@ -557,7 +569,6 @@ public:
   }
 
   void add(Context &ctx, Symbol *sym);
-  void copy_buf(Context &ctx) override;
 
   std::vector<Symbol *> syms;
 
@@ -572,6 +583,20 @@ public:
   }
 
   void copy_buf(Context &ctx) override;
+
+  static constexpr i64 ENTRY_SIZE = 8;
+};
+
+class ThreadPtrsSection : public Chunk {
+public:
+  ThreadPtrsSection(Context &ctx) : Chunk(ctx, "__DATA", "__thread_ptrs") {
+    hdr.p2align = __builtin_ctz(8);
+    hdr.type = S_THREAD_LOCAL_VARIABLE_POINTERS;
+  }
+
+  void add(Context &ctx, Symbol *sym);
+
+  std::vector<Symbol *> syms;
 
   static constexpr i64 ENTRY_SIZE = 8;
 };
@@ -652,6 +677,12 @@ void parse_nonpositional_args(Context &ctx,
                               std::vector<std::string> &remaining);
 
 //
+// dead-strip.cc
+//
+
+void dead_strip(Context &ctx);
+
+//
 // main.cc
 //
 
@@ -685,6 +716,7 @@ struct Context {
   // Command-line arguments
   struct {
     bool adhoc_codesign = false;
+    bool dead_strip = true;
     bool deduplicate = true;
     bool demangle = false;
     bool dynamic = true;
@@ -694,7 +726,9 @@ struct Context {
     i64 platform_min_version = 0;
     i64 platform_sdk_version = 0;
     i64 headerpad = 256;
+    i64 pagezero_size = 0x100000000;
     std::string chroot;
+    std::string entry = "_main";
     std::string map;
     std::string output;
     std::vector<std::string> syslibroot;
@@ -737,6 +771,7 @@ struct Context {
   LazySymbolPtrSection lazy_symbol_ptr{*this};
   CodeSignatureSection code_sig{*this};
   DataInCodeSection data_in_code{*this};
+  ThreadPtrsSection thread_ptrs{*this};
 
   OutputRebaseSection rebase{*this};
   OutputBindSection bind{*this};
@@ -760,6 +795,10 @@ int main(int argc, char **argv);
 // Inline functions
 //
 
+u64 Subsection::get_addr(Context &ctx) const {
+  return ctx.arg.pagezero_size + raddr;
+}
+
 u64 Symbol::get_addr(Context &ctx) const {
   if (subsec)
     return subsec->get_addr(ctx) + value;
@@ -771,6 +810,11 @@ u64 Symbol::get_addr(Context &ctx) const {
 u64 Symbol::get_got_addr(Context &ctx) const {
   assert(got_idx != -1);
   return ctx.got.hdr.addr + got_idx * GotSection::ENTRY_SIZE;
+}
+
+u64 Symbol::get_tlv_addr(Context &ctx) const {
+  assert(tlv_idx != -1);
+  return ctx.thread_ptrs.hdr.addr + tlv_idx * ThreadPtrsSection::ENTRY_SIZE;
 }
 
 inline Symbol *intern(Context &ctx, std::string_view name) {

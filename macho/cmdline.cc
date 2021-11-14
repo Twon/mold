@@ -15,8 +15,10 @@ Options:
   -adhoc_codesign             Add ad-hoc code signature to the output file
     -no_adhoc_codesign
   -arch <ARCH_NAME>           Specify target architecture
+  -dead_strip                 Remove unreachable functions and data
   -demangle                   Demangle C++ symbols in log messages (default)
   -dynamic                    Link against dylibs (default)
+  -e <SYMBOL>                 Specify the entry point of a main executable
   -headerpad <SIZE>           Allocate the size of padding after load commands
   -help                       Report usage information
   -l<LIB>                     Search for a given library
@@ -24,6 +26,7 @@ Options:
   -map <FILE>                 Write map file to a given file
   -no_deduplicate             Ignored
   -o <FILE>                   Set output filename
+  -pagezero_size <SIZE>       Specify the size of the __PAGEZERO segment
   -platform_version <PLATFORM> <MIN_VERSION> <SDK_VERSION>
                               Set platform, platform version and SDK version
   -syslibroot <DIR>           Prepend DIR to library search paths
@@ -141,6 +144,8 @@ void parse_nonpositional_args(Context &ctx,
     } else if (read_arg("-arch")) {
       if (arg != "x86_64")
         Fatal(ctx) << "unknown -arch: " << arg;
+    } else if (read_flag("-dead_strip")) {
+      ctx.arg.dead_strip = true;
     } else if (read_flag("-demangle")) {
       ctx.arg.demangle = true;
     } else if (read_arg("-headerpad")) {
@@ -150,6 +155,8 @@ void parse_nonpositional_args(Context &ctx,
         Fatal(ctx) << "malformed -headerpad: " << arg;
     } else if (read_flag("-dynamic")) {
       ctx.arg.dynamic = true;
+    } else if (read_arg("-e")) {
+      ctx.arg.entry = arg;
     } else if (read_arg("-lto_library")) {
     } else if (read_joined("-l")) {
       remaining.push_back("-l" + std::string(arg));
@@ -158,6 +165,11 @@ void parse_nonpositional_args(Context &ctx,
     } else if (read_flag("-no_deduplicate")) {
     } else if (read_arg("-o")) {
       ctx.arg.output = arg;
+    } else if (read_arg("-pagezero_size")) {
+      size_t pos;
+      ctx.arg.pagezero_size = std::stoi(std::string(arg), &pos, 16);
+      if (pos != arg.size())
+        Fatal(ctx) << "malformed -pagezero_size: " << arg;
     } else if (read_arg3("-platform_version")) {
       ctx.arg.platform = parse_platform(ctx, arg);
       ctx.arg.platform_min_version = parse_version(ctx, arg2);

@@ -24,7 +24,7 @@ static std::vector<u8> create_page_zero_cmd(Context &ctx) {
   cmd.cmd = LC_SEGMENT_64;
   cmd.cmdsize = buf.size();
   strcpy(cmd.segname, "__PAGEZERO");
-  cmd.vmsize = PAGE_ZERO_SIZE;
+  cmd.vmsize = ctx.arg.pagezero_size;
   return buf;
 }
 
@@ -140,7 +140,7 @@ static std::vector<u8> create_main_cmd(Context &ctx) {
 
   cmd.cmd = LC_MAIN;
   cmd.cmdsize = buf.size();
-  cmd.entryoff = intern(ctx, "_main")->get_addr(ctx) - PAGE_ZERO_SIZE;
+  cmd.entryoff = intern(ctx, ctx.arg.entry)->get_addr(ctx) - ctx.arg.pagezero_size;
   return buf;
 }
 
@@ -248,6 +248,14 @@ void OutputMachHeader::compute_size(Context &ctx) {
   hdr.size = sizeof(MachHeader) + cmds.size() + ctx.arg.headerpad;
 }
 
+static bool has_tlv(Context &ctx) {
+  for (std::unique_ptr<OutputSegment> &seg : ctx.segments)
+    for (Chunk *chunk : seg->chunks)
+      if (chunk->hdr.type == S_THREAD_LOCAL_VARIABLES)
+        return true;
+  return false;
+}
+
 void OutputMachHeader::copy_buf(Context &ctx) {
   u8 *buf = ctx.buf + hdr.offset;
 
@@ -264,6 +272,9 @@ void OutputMachHeader::copy_buf(Context &ctx) {
   mhdr.sizeofcmds = cmds.size();
   mhdr.flags = MH_TWOLEVEL | MH_NOUNDEFS | MH_DYLDLINK | MH_PIE;
 
+  if (has_tlv(ctx))
+    mhdr.flags |= MH_HAS_TLV_DESCRIPTORS;
+
   write_vector(buf + sizeof(mhdr), cmds);
 }
 
@@ -274,8 +285,7 @@ OutputSection::get_instance(Context &ctx, std::string_view segname,
 
   auto find = [&]() -> OutputSection * {
     for (Chunk *chunk : ctx.chunks) {
-      if (chunk->hdr.get_segname() == segname &&
-          chunk->hdr.get_sectname() == sectname) {
+      if (chunk->hdr.match(segname, sectname)) {
         if (!chunk->is_regular)
           Fatal(ctx) << ": reserved name is used: " << segname << "," << sectname;
         return (OutputSection *)chunk;
@@ -310,7 +320,7 @@ void OutputSection::compute_size(Context &ctx) {
 
   for (Subsection *subsec : members) {
     addr = align_to(addr, 1 << subsec->p2align);
-    subsec->raddr = addr - PAGE_ZERO_SIZE;
+    subsec->raddr = addr - ctx.arg.pagezero_size;
     addr += subsec->input_size;
   }
   hdr.size = addr - hdr.addr;
@@ -481,11 +491,6 @@ void OutputRebaseSection::compute_size(Context &ctx) {
             ctx.lazy_symbol_ptr.hdr.addr + i * LazySymbolPtrSection::ENTRY_SIZE -
             ctx.data_seg->cmd.vmaddr);
 
-  for (Symbol *sym : ctx.got.syms)
-    if (!sym->file->is_dylib)
-      enc.add(ctx.data_const_seg->seg_idx,
-              sym->get_got_addr(ctx) - ctx.data_const_seg->cmd.vmaddr);
-
   for (std::unique_ptr<OutputSegment> &seg : ctx.segments)
     for (Chunk *chunk : seg->chunks)
       if (chunk->is_regular)
@@ -553,6 +558,12 @@ void OutputBindSection::compute_size(Context &ctx) {
       enc.add(((DylibFile *)sym->file)->dylib_idx, sym->name, 0,
               ctx.data_const_seg->seg_idx,
               sym->get_got_addr(ctx) - ctx.data_const_seg->cmd.vmaddr);
+
+  for (Symbol *sym : ctx.thread_ptrs.syms)
+    if (sym->file->is_dylib)
+      enc.add(((DylibFile *)sym->file)->dylib_idx, sym->name, 0,
+              ctx.data_seg->seg_idx,
+              sym->get_tlv_addr(ctx) - ctx.data_seg->cmd.vmaddr);
 
   enc.finish();
 
@@ -712,8 +723,8 @@ void ExportEncoder::write_trie(u8 *start, TrieNode &node) {
 void OutputExportSection::compute_size(Context &ctx) {
   for (ObjectFile *file : ctx.objs)
     for (Symbol *sym : file->syms)
-      if (sym->is_extern && sym->file == file)
-        enc.add(sym->name, 0, sym->get_addr(ctx) - PAGE_ZERO_SIZE);
+      if (sym && sym->is_extern && sym->file == file)
+        enc.add(sym->name, 0, sym->get_addr(ctx) - ctx.arg.pagezero_size);
 
   hdr.size = align_to(enc.finish(), 8);
 }
@@ -725,9 +736,10 @@ void OutputExportSection::copy_buf(Context &ctx) {
 void OutputFunctionStartsSection::compute_size(Context &ctx) {
   std::vector<u64> addrs;
 
-  for (ObjectFile *obj : ctx.objs)
-    for (Symbol *sym : obj->syms)
-      if (sym->file == obj && sym->subsec && &sym->subsec->isec.osec == ctx.text)
+  for (ObjectFile *file : ctx.objs)
+    for (Symbol *sym : file->syms)
+      if (sym && sym->file == file && sym->subsec &&
+          &sym->subsec->isec.osec == ctx.text)
         addrs.push_back(sym->get_addr(ctx));
 
   std::sort(addrs.begin(), addrs.end());
@@ -735,7 +747,7 @@ void OutputFunctionStartsSection::compute_size(Context &ctx) {
   contents.resize(addrs.size() * 5);
 
   u8 *p = contents.data();
-  u64 last = PAGE_ZERO_SIZE;
+  u64 last = ctx.arg.pagezero_size;
 
   for (u64 val : addrs) {
     p += write_uleb(p, val - last);
@@ -751,16 +763,16 @@ void OutputFunctionStartsSection::copy_buf(Context &ctx) {
 }
 
 void OutputSymtabSection::compute_size(Context &ctx) {
-  for (ObjectFile *obj : ctx.objs)
-    for (Symbol *sym : obj->syms)
-      if (sym->file == obj)
+  for (ObjectFile *file : ctx.objs)
+    for (Symbol *sym : file->syms)
+      if (sym && sym->file == file)
         globals.push_back({sym, ctx.strtab.add_string(sym->name)});
 
   i64 idx = globals.size();
 
   for (DylibFile *dylib : ctx.dylibs) {
     for (Symbol *sym : dylib->syms) {
-      if (sym->file == dylib) {
+      if (sym && sym->file == dylib) {
         if (sym->stub_idx != -1 || sym->got_idx != -1) {
           undefs.push_back({sym, ctx.strtab.add_string(sym->name)});
 
@@ -910,24 +922,21 @@ void DataInCodeSection::compute_size(Context &ctx) {
   for (ObjectFile *file : ctx.objs) {
     std::span<DataInCodeEntry> entries = file->data_in_code_entries;
 
-    for (i64 i = 0; !entries.empty() && i < file->sections.size(); i++) {
-      InputSection &sec = *file->sections[i];
+    for (std::unique_ptr<Subsection> &subsec : file->subsections) {
+      if (entries.empty())
+        break;
 
-      for (i64 j = 0; !entries.empty() && j < sec.subsections.size(); j++) {
-        Subsection &subsec = *sec.subsections[j];
-        DataInCodeEntry &ent = entries[0];
+      DataInCodeEntry &ent = entries[0];
+      if (subsec->input_addr + subsec->input_size < ent.offset)
+        continue;
 
-        if (subsec.input_addr + subsec.input_size < ent.offset)
-          continue;
-
-        if (ent.offset < subsec.input_addr + subsec.input_size) {
-          u32 offset = subsec.get_addr(ctx) + subsec.input_addr - ent.offset -
-                       ctx.text_seg->cmd.vmaddr;
-          contents.push_back({offset, ent.length, ent.kind});
-        }
-
-        entries = entries.subspan(1);
+      if (ent.offset < subsec->input_addr + subsec->input_size) {
+        u32 offset = subsec->get_addr(ctx) + subsec->input_addr - ent.offset -
+                     ctx.text_seg->cmd.vmaddr;
+        contents.push_back({offset, ent.length, ent.kind});
       }
+
+      entries = entries.subspan(1);
     }
   }
 
@@ -1133,7 +1142,8 @@ static std::vector<u8> construct_unwind_info(Context &ctx) {
       if (chunk->is_regular)
         for (Subsection *subsec : ((OutputSection *)chunk)->members)
           for (UnwindRecord &rec : subsec->get_unwind_records())
-            records.push_back(rec);
+            if (!ctx.arg.dead_strip || rec.is_alive)
+              records.push_back(rec);
   return UnwindEncoder().encode(ctx, records);
 }
 
@@ -1152,19 +1162,19 @@ void GotSection::add(Context &ctx, Symbol *sym) {
   hdr.size = syms.size() * ENTRY_SIZE;
 }
 
-void GotSection::copy_buf(Context &ctx) {
-  u64 *buf = (u64 *)(ctx.buf + hdr.offset);
-  for (i64 i = 0; i < syms.size(); i++)
-    if (!syms[i]->file->is_dylib)
-      buf[i] = syms[i]->get_addr(ctx);
-}
-
 void LazySymbolPtrSection::copy_buf(Context &ctx) {
   u64 *buf = (u64 *)(ctx.buf + hdr.offset);
 
   for (i64 i = 0; i < ctx.stubs.syms.size(); i++)
     buf[i] = ctx.stub_helper.hdr.addr + StubHelperSection::HEADER_SIZE +
              i * StubHelperSection::ENTRY_SIZE;
+}
+
+void ThreadPtrsSection::add(Context &ctx, Symbol *sym) {
+  assert(sym->tlv_idx == -1);
+  sym->tlv_idx = syms.size();
+  syms.push_back(sym);
+  hdr.size = syms.size() * ENTRY_SIZE;
 }
 
 } // namespace mold::macho

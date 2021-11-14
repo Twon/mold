@@ -29,7 +29,7 @@ static void create_internal_file(Context &ctx) {
   Symbol *sym = add("__mh_execute_header");
   sym->is_extern = true;
   sym->referenced_dynamically = true;
-  sym->value = PAGE_ZERO_SIZE;
+  sym->value = ctx.arg.pagezero_size;
 }
 
 static bool compare_segments(const std::unique_ptr<OutputSegment> &a,
@@ -76,8 +76,12 @@ static bool compare_chunks(const Chunk *a, const Chunk *b) {
     // __DATA_CONST
     "__got",
     // __DATA
-    "__la_symbol_ptr"
+    "__la_symbol_ptr",
     "__data",
+    "__thread_ptr",
+    "__thread_data",
+    "__thread_vars",
+    "__thread_bss",
     "__common",
     "__bss",
     // __LINKEDIT
@@ -111,13 +115,9 @@ static bool compare_chunks(const Chunk *a, const Chunk *b) {
 }
 
 static void create_synthetic_chunks(Context &ctx) {
-  for (ObjectFile *file : ctx.objs) {
-    for (std::unique_ptr<InputSection> &isec : file->sections) {
-      for (std::unique_ptr<Subsection> &subsec : isec->subsections)
-        isec->osec.add_subsec(subsec.get());
-      isec->osec.hdr.attr |= isec->hdr.attr;
-    }
-  }
+  for (ObjectFile *file : ctx.objs)
+    for (std::unique_ptr<Subsection> &subsec : file->subsections)
+      subsec->isec.osec.add_subsec(subsec.get());
 
   for (Chunk *chunk : ctx.chunks) {
     if (chunk != ctx.data && chunk->is_regular &&
@@ -138,18 +138,29 @@ static void create_synthetic_chunks(Context &ctx) {
 static void export_symbols(Context &ctx) {
   ctx.got.add(ctx, intern(ctx, "dyld_stub_binder"));
 
-  for (ObjectFile *file : ctx.objs)
-    for (Symbol *sym : file->syms)
-      if (sym->file == file && sym->flags & NEEDS_GOT)
-        ctx.got.add(ctx, sym);
+  for (ObjectFile *file : ctx.objs) {
+    for (Symbol *sym : file->syms) {
+      if (sym && sym->file == file) {
+        if (sym->flags & NEEDS_GOT)
+          ctx.got.add(ctx, sym);
+        if (sym->flags & NEEDS_THREAD_PTR)
+          ctx.thread_ptrs.add(ctx, sym);
+      }
+    }
+  }
 
   for (DylibFile *file : ctx.dylibs) {
     for (Symbol *sym : file->syms) {
+      if (!sym)
+        continue;
+
       if (sym->file == file)
         if (sym->flags & NEEDS_STUB)
           ctx.stubs.add(ctx, sym);
       if (sym->flags & NEEDS_GOT)
         ctx.got.add(ctx, sym);
+      if (sym->flags & NEEDS_THREAD_PTR)
+        ctx.thread_ptrs.add(ctx, sym);
     }
   }
 }
@@ -162,7 +173,7 @@ static i64 assign_offsets(Context &ctx) {
         chunk->sect_idx = sect_idx++;
 
   i64 fileoff = 0;
-  i64 vmaddr = PAGE_ZERO_SIZE;
+  i64 vmaddr = ctx.arg.pagezero_size;
 
   for (std::unique_ptr<OutputSegment> &seg : ctx.segments) {
     seg->set_offset(ctx, fileoff, vmaddr);
@@ -283,6 +294,9 @@ int main(int argc, char **argv) {
   for (DylibFile *dylib : ctx.dylibs)
     dylib->resolve_symbols(ctx);
 
+  if (!intern(ctx, ctx.arg.entry)->file)
+    Error(ctx) << "undefined entry point symbol: " << ctx.arg.entry;
+
   create_internal_file(ctx);
 
   erase(ctx.objs, [](ObjectFile *file) { return !file->is_alive; });
@@ -298,14 +312,20 @@ int main(int argc, char **argv) {
   for (ObjectFile *file : ctx.objs)
     file->convert_common_symbols(ctx);
 
+  if (ctx.arg.dead_strip)
+    dead_strip(ctx);
+
   create_synthetic_chunks(ctx);
+
+  for (ObjectFile *file : ctx.objs)
+    file->check_duplicate_symbols(ctx);
 
   for (i64 i = 0; i < ctx.segments.size(); i++)
     ctx.segments[i]->seg_idx = i + 1;
 
   for (ObjectFile *file : ctx.objs)
-    for (std::unique_ptr<InputSection> &sec : file->sections)
-      sec->scan_relocations(ctx);
+    for (std::unique_ptr<Subsection > &subsec : file->subsections)
+      subsec->scan_relocations(ctx);
 
   export_symbols(ctx);
   i64 output_size = assign_offsets(ctx);
