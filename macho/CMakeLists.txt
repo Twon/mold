@@ -1,6 +1,7 @@
 target_sources(mold
     PRIVATE
         cmdline.cc
+        dead-strip.cc
         dumper.cc
         input-sections.cc
         macho.h
