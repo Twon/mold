@@ -1,5 +1,7 @@
 target_sources(mold
     PRIVATE
+        arch-arm64.cc
+        arch-x86-64.cc
         cmdline.cc
         dead-strip.cc
         dumper.cc

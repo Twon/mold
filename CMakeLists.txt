@@ -14,6 +14,16 @@ find_package(xxHash REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 
+include(CTest)
+include(FetchContent)
+include(GNUInstallDirs)
+include(CMakeDependentOption)
+include(CMakePackageConfigHelpers)
+
+#cmake_dependent_option(ENABLE_CODE_COVERAGE "Enable code coverage" ON "\"${CMAKE_CXX_COMPILER_ID}\" STREQUAL \"Clang\" OR \"${CMAKE_CXX_COMPILER_ID}\" STREQUAL \"GNU\"" OFF)
+#cmake_dependent_option(ENABLE_INCLUDE_NATVIS "Enable inclusion of a natvis file for debugging" ON "\"${CMAKE_CXX_COMPILER_ID}\" STREQUAL \"MSVC\"" OFF)
+#option(ENABLE_SANITIZERS "Enable Address Sanitizer and Undefined Behaviour Sanitizer if available" OFF)
+
 add_executable(mold "")
 
 set_property(TARGET mold PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -56,9 +66,9 @@ target_compile_definitions(mold
 
 target_link_libraries(mold
     PUBLIC
-        OpenSSL::Crypto
+        $<$<NOT:$<BOOL:APPLE>>:OpenSSL::Crypto>
         TBB::tbb
-        Threads::Threads
+        Threads::Threads    
         xxHash::xxhash
         ZLIB::ZLIB
 )

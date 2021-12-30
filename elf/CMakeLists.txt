@@ -1,6 +1,6 @@
 target_sources(mold
     PRIVATE
-        arch-aarch64.cc
+        arch-arm64.cc
         arch-i386.cc
         arch-x86-64.cc
         cmdline.cc
