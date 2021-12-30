@@ -86,7 +86,7 @@ u32 ObjectFile<E>::read_note_gnu_property(Context<E> &ctx,
     data = data.substr(align_to(hdr.n_namesz, 4));
 
     std::string_view desc = data.substr(0, hdr.n_descsz);
-    data = data.substr(align_to(hdr.n_descsz, E::wordsize));
+    data = data.substr(align_to(hdr.n_descsz, E::word_size));
 
     if (hdr.n_type != NT_GNU_PROPERTY_TYPE_0 || name != "GNU")
       continue;
@@ -97,7 +97,7 @@ u32 ObjectFile<E>::read_note_gnu_property(Context<E> &ctx,
       desc = desc.substr(8);
       if (type == GNU_PROPERTY_X86_FEATURE_1_AND)
         ret |= *(u32 *)desc.data();
-      desc = desc.substr(align_to(size, E::wordsize));
+      desc = desc.substr(align_to(size, E::word_size));
     }
   }
   return ret;
@@ -447,7 +447,10 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
 
   // Initialize local symbols
   this->local_syms.reset(new Symbol<E>[first_global]);
+
   new (&this->local_syms[0]) Symbol<E>;
+  this->local_syms[0].file = this;
+  this->local_syms[0].sym_idx = 0;
 
   for (i64 i = 1; i < first_global; i++) {
     const ElfSym<E> &esym = elf_syms[i];
@@ -479,7 +482,7 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
   this->symbols.resize(elf_syms.size());
 
   i64 num_globals = elf_syms.size() - first_global;
-  sym_subsections.resize(elf_syms.size());
+  sym_fragments.resize(elf_syms.size());
   symvers.resize(num_globals);
 
   for (i64 i = 0; i < first_global; i++)
@@ -537,7 +540,7 @@ static size_t find_null(std::string_view data, u64 entsize) {
 // contain fixed-sized read-only records too.
 //
 // This function splits the section contents into small pieces that we
-// call "subsections". Subsection is a unit of merging.
+// call "section fragments". Section fragment is a unit of merging.
 //
 // We do not support mergeable sections that have relocations.
 template <typename E>
@@ -553,7 +556,7 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
   u64 entsize = sec.shdr.sh_entsize;
   HyperLogLog estimator;
 
-  static_assert(sizeof(Subsection<E>::alignment) == 2);
+  static_assert(sizeof(SectionFragment<E>::alignment) == 2);
   if (sec.shdr.sh_addralign >= UINT16_MAX)
     Fatal(ctx) << sec << ": alignment too large";
 
@@ -567,7 +570,7 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
       data = data.substr(end + entsize);
 
       rec->strings.push_back(substr);
-      rec->subsec_offsets.push_back(substr.data() - begin);
+      rec->frag_offsets.push_back(substr.data() - begin);
 
       u64 hash = hash_string(substr);
       rec->hashes.push_back(hash);
@@ -582,7 +585,7 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
       data = data.substr(entsize);
 
       rec->strings.push_back(substr);
-      rec->subsec_offsets.push_back(substr.data() - begin);
+      rec->frag_offsets.push_back(substr.data() - begin);
 
       u64 hash = hash_string(substr);
       rec->hashes.push_back(hash);
@@ -592,8 +595,8 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
 
   rec->parent->estimator.merge(estimator);
 
-  static Counter counter("string_subsections");
-  counter += rec->subsections.size();
+  static Counter counter("string_fragments");
+  counter += rec->fragments.size();
   return rec;
 }
 
@@ -602,7 +605,7 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
 // mergeable section (a section with SHF_MERGE bit set), the linker
 // is expected split it into smaller pieces and merge each piece with
 // other pieces from different object files. In mold, we call the
-// atomic unit of mergeable section "subsections".
+// atomic unit of mergeable section "section pieces".
 //
 // This feature is typically used for string literals. String literals
 // are usually put into a mergeable section by a compiler. If the same
@@ -621,7 +624,7 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
 //   .L.str0
 //
 // '\0' represents a NUL byte. This mergeable section contains two
-// subsections, "Hello world" and "foo bar". The first string is
+// section pieces, "Hello world" and "foo bar". The first string is
 // referred by two symbols, .rodata and .L.str0, and the second by
 // .L.str1. .rodata is a section symbol and therefore a local symbol
 // and refers the begining of the section.
@@ -631,13 +634,13 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
 // place in the section. This kind of "out-of-bound" reference occurs
 // only when a symbol is a section symbol. In other words, compiler
 // may use an offset from the beginning of a section to refer any
-// subsection in a section, but it doesn't do for any other types
+// section piece in a section, but it doesn't do for any other types
 // of symbols.
 //
-// In mold, we attach subsections to either relocations or symbols.
+// In mold, we attach section pieces to either relocations or symbols.
 // If a relocation refers a section symbol whose section is a
-// mergeable section, a subsection is attached to the relocation.
-// If a non-section symbol refers a subsection, the subsection
+// mergeable section, a section piece is attached to the relocation.
+// If a non-section symbol refers a section piece, the section piece
 // is attached to the symbol.
 template <typename E>
 void ObjectFile<E>::initialize_mergeable_sections(Context<E> &ctx) {
@@ -655,14 +658,14 @@ void ObjectFile<E>::initialize_mergeable_sections(Context<E> &ctx) {
 }
 
 template <typename E>
-void ObjectFile<E>::register_subsections(Context<E> &ctx) {
+void ObjectFile<E>::register_section_pieces(Context<E> &ctx) {
   for (std::unique_ptr<MergeableSection<E>> &m : mergeable_sections)
     if (m)
       for (i64 i = 0; i < m->strings.size(); i++)
-        m->subsections.push_back(m->parent->insert(m->strings[i], m->hashes[i],
-                                                   m->shdr.sh_addralign));
+        m->fragments.push_back(m->parent->insert(m->strings[i], m->hashes[i],
+                                                 m->shdr.sh_addralign));
 
-  // Initialize rel_subsections
+  // Initialize rel_fragments
   for (std::unique_ptr<InputSection<E>> &isec : sections) {
     if (!isec || !isec->is_alive)
       continue;
@@ -671,7 +674,7 @@ void ObjectFile<E>::register_subsections(Context<E> &ctx) {
     if (rels.empty())
       continue;
 
-    // Compute the size of rel_subsections.
+    // Compute the size of rel_fragments.
     i64 len = 0;
     for (i64 i = 0; i < rels.size(); i++) {
       const ElfRel<E> &rel = rels[i];
@@ -683,10 +686,10 @@ void ObjectFile<E>::register_subsections(Context<E> &ctx) {
     if (len == 0)
       continue;
 
-    isec->rel_subsections.reset(new SubsectionRef<E>[len + 1]);
-    i64 subsec_idx = 0;
+    isec->rel_fragments.reset(new SectionFragmentRef<E>[len + 1]);
+    i64 frag_idx = 0;
 
-    // Fill rel_subsections contents.
+    // Fill rel_fragments contents.
     for (i64 i = 0; i < rels.size(); i++) {
       const ElfRel<E> &rel = rels[i];
       const ElfSym<E> &esym = elf_syms[rel.r_sym];
@@ -699,22 +702,22 @@ void ObjectFile<E>::register_subsections(Context<E> &ctx) {
         continue;
 
       i64 offset = esym.st_value + isec->get_addend(rel);
-      std::span<u32> offsets = m->subsec_offsets;
+      std::span<u32> offsets = m->frag_offsets;
 
       auto it = std::upper_bound(offsets.begin(), offsets.end(), offset);
       if (it == offsets.begin())
         Fatal(ctx) << *this << ": bad relocation at " << rel.r_sym;
       i64 idx = it - 1 - offsets.begin();
 
-      isec->rel_subsections[subsec_idx++] = {m->subsections[idx], (i32)i,
+      isec->rel_fragments[frag_idx++] = {m->fragments[idx], (i32)i,
                                          (i32)(offset - offsets[idx])};
     }
 
-    isec->rel_subsections[subsec_idx++] = {nullptr, -1, -1};
+    isec->rel_fragments[frag_idx++] = {nullptr, -1, -1};
   }
 
-  // Initialize sym_subsections
-  for (i64 i = 0; i < elf_syms.size(); i++) {
+  // Initialize sym_fragments
+  for (i64 i = 1; i < elf_syms.size(); i++) {
     const ElfSym<E> &esym = elf_syms[i];
     if (esym.is_abs() || esym.is_common() || esym.is_undef())
       continue;
@@ -724,7 +727,7 @@ void ObjectFile<E>::register_subsections(Context<E> &ctx) {
     if (!m)
       continue;
 
-    std::span<u32> offsets = m->subsec_offsets;
+    std::span<u32> offsets = m->frag_offsets;
 
     auto it = std::upper_bound(offsets.begin(), offsets.end(), esym.st_value);
     if (it == offsets.begin())
@@ -734,14 +737,13 @@ void ObjectFile<E>::register_subsections(Context<E> &ctx) {
     if (i < first_global)
       this->symbols[i]->value = esym.st_value - offsets[idx];
 
-    sym_subsections[i].subsec = m->subsections[idx];
-    sym_subsections[i].addend = esym.st_value - offsets[idx];
+    sym_fragments[i].frag = m->fragments[idx];
+    sym_fragments[i].addend = esym.st_value - offsets[idx];
   }
 
   for (std::unique_ptr<MergeableSection<E>> &m : mergeable_sections)
     if (m)
-      subsections.insert(subsections.end(), m->subsections.begin(),
-                         m->subsections.end());
+      fragments.insert(fragments.end(), m->fragments.begin(), m->fragments.end());
 }
 
 template <typename E>
@@ -802,7 +804,7 @@ void ObjectFile<E>::override_symbol(Context<E> &ctx, Symbol<E> &sym,
   sym.file = this;
   sym.input_section = esym.is_abs() ? nullptr : get_section(esym);
 
-  if (SubsectionRef<E> &ref = sym_subsections[symidx]; ref.subsec)
+  if (SectionFragmentRef<E> &ref = sym_fragments[symidx]; ref.frag)
     sym.value = ref.addend;
   else
     sym.value = esym.st_value;
@@ -889,7 +891,11 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
   for (i64 i = first_global; i < this->symbols.size(); i++) {
     const ElfSym<E> &esym = elf_syms[i];
     Symbol<E> &sym = *this->symbols[i];
-    merge_visibility(ctx, sym, exclude_libs ? STV_HIDDEN : esym.st_visibility);
+
+    u8 visibility = esym.st_visibility;
+    if (esym.is_defined() && exclude_libs)
+      visibility = STV_HIDDEN;
+    merge_visibility(ctx, sym, visibility);
 
     if (sym.traced) {
       if (esym.is_defined())
@@ -986,20 +992,37 @@ void ObjectFile<E>::claim_unresolved_symbols(Context<E> &ctx) {
 
     std::lock_guard lock(sym.mu);
 
-    auto claim = [&](bool is_imported) {
+    if (sym.file &&
+        (!sym.esym().is_undef() || sym.file->priority <= this->priority))
+      continue;
+
+    // If a symbol name is in the form of "foo@version", search for
+    // symbol "foo" and check if the symbol has version "version".
+    std::string_view key = symbol_strtab.data() + esym.st_name;
+    if (i64 pos = key.find('@'); pos != key.npos) {
+      Symbol<E> *sym2 = intern(ctx, key.substr(0, pos));
+      if (sym2->file && sym2->file->is_dso &&
+          sym2->get_version() == key.substr(pos + 1)) {
+        this->symbols[i] = sym2;
+        continue;
+      }
+    }
+
+    auto claim = [&]() {
       sym.file = this;
       sym.input_section = nullptr;
       sym.value = 0;
       sym.sym_idx = i;
-      sym.ver_idx = ctx.arg.default_version;
       sym.is_lazy = false;
       sym.is_weak = false;
-      sym.is_imported = is_imported;
       sym.is_exported = false;
     };
 
-    if (!sym.file ||
-        (sym.esym().is_undef() && sym.file->priority < this->priority)) {
+    if (ctx.arg.unresolved_symbols == UnresolvedKind::WARN)
+      Warn(ctx) << "undefined symbol: " << *this << ": " << sym;
+
+    // Convert remaining undefined symbols to dynamic symbols.
+    if (ctx.arg.shared) {
       // Traditionally, remaining undefined symbols cause a link failure
       // only when we are creating an executable. Undefined symbols in
       // shared objects are promoted to dynamic symbols, so that they'll
@@ -1010,21 +1033,26 @@ void ObjectFile<E>::claim_unresolved_symbols(Context<E> &ctx) {
       // promoted to dynamic symbols for compatibility with other linkers.
       // Some major programs, notably Firefox, depend on the behavior
       // (they use this loophole to export symbols from libxul.so).
-      if (ctx.arg.shared && (!ctx.arg.z_defs || esym.is_undef_weak())) {
-        // Convert remaining undefined symbols to dynamic symbols.
-        claim(!ctx.arg.is_static);
+      if (!ctx.arg.z_defs || esym.is_undef_weak() ||
+          ctx.arg.unresolved_symbols != UnresolvedKind::ERROR) {
+        claim();
+        sym.ver_idx = 0;
+        sym.is_imported = true;
+
         if (sym.traced)
           SyncOut(ctx) << "trace-symbol: " << *this << ": unresolved"
                        << (esym.is_weak() ? " weak" : "")
                        << " symbol " << sym;
-      } else if (ctx.arg.unresolved_symbols != UnresolvedKind::ERROR ||
-                 esym.is_undef_weak()) {
-        // Convert remaining undefined symbols to absolute symbols with
-        // value 0.
-        claim(false);
-        if (ctx.arg.unresolved_symbols == UnresolvedKind::WARN)
-          Warn(ctx) << "undefined symbol: " << *this << ": " << sym;
+        continue;
       }
+    }
+
+    // Convert remaining undefined symbols to absolute symbols with value 0.
+    if (ctx.arg.unresolved_symbols != UnresolvedKind::ERROR ||
+        esym.is_undef_weak()) {
+      claim();
+      sym.ver_idx = ctx.arg.default_version;
+      sym.is_imported = false;
     }
   }
 }
@@ -1230,14 +1258,16 @@ SharedFile<E>::SharedFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
 }
 
 template <typename E>
-std::string_view SharedFile<E>::get_soname(Context<E> &ctx) {
+std::string SharedFile<E>::get_soname(Context<E> &ctx) {
   if (ElfShdr<E> *sec = this->find_section(SHT_DYNAMIC))
     for (ElfDyn<E> &dyn : this->template get_data<ElfDyn<E>>(ctx, *sec))
       if (dyn.d_tag == DT_SONAME)
         return symbol_strtab.data() + dyn.d_val;
+
   if (this->mf->given_fullpath)
     return this->filename;
-  return path_filename(this->filename);
+
+  return filepath(this->filename).filename();
 }
 
 template <typename E>
@@ -1375,6 +1405,6 @@ bool SharedFile<E>::is_readonly(Context<E> &ctx, Symbol<E> *sym) {
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
-INSTANTIATE(AARCH64);
+INSTANTIATE(ARM64);
 
 } // namespace mold::elf

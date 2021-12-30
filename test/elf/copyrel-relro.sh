@@ -1,12 +1,14 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
-mkdir -p $t
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t="$(pwd)/out/test/elf/$testname"
+mkdir -p "$t"
 
-cat <<EOF | cc -o $t/a.o -c -xc -fno-PIE -
+cat <<EOF | cc -o "$t"/a.o -c -xc -fno-PIE -
 extern const char readonly[100];
 extern char readwrite[100];
 
@@ -15,15 +17,15 @@ int main() {
 }
 EOF
 
-cat <<EOF | cc -shared -o $t/b.so -xc -
+cat <<EOF | cc -shared -o "$t"/b.so -xc -
 const char readonly[100] = "abc";
 char readwrite[100] = "abc";
 EOF
 
-clang -fuse-ld=$mold $t/a.o $t/b.so -o $t/exe
-readelf -a $t/exe > $t/log
+clang -fuse-ld="$mold" "$t"/a.o "$t"/b.so -o "$t"/exe
+readelf -a "$t"/exe > "$t"/log
 
-grep -Pqz '(?s)\[(\d+)\] .dynbss.rel.ro .* \1 readonly' $t/log
-grep -Pqz '(?s)\[(\d+)\] .dynbss .* \1 readwrite' $t/log
+grep -Pqz '(?s)\[(\d+)\] .dynbss.rel.ro .* \1 readonly' "$t"/log
+grep -Pqz '(?s)\[(\d+)\] .dynbss .* \1 readwrite' "$t"/log
 
 echo OK

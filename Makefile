@@ -1,3 +1,11 @@
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+LIBDIR ?= $(PREFIX)/lib
+LIBEXECDIR ?= $(PREFIX)/libexec
+MANDIR ?= $(PREFIX)/share/man
+
+D = $(DESTDIR)
+
 ifeq ($(origin CC), default)
   CC = clang
 endif
@@ -6,20 +14,25 @@ ifeq ($(origin CXX), default)
   CXX = clang++
 endif
 
+STRIP ?= strip
+
 OS ?= $(shell uname -s)
 
-CPPFLAGS = -pthread -std=c++20 -fPIE -DMOLD_VERSION=\"0.9.6\" \
-	   -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables \
-	   $(EXTRA_CPPFLAGS)
-LDFLAGS += $(EXTRA_LDFLAGS)
-LIBS = -pthread -lz -lxxhash -ldl -lm
+# Used for both C and C++
+COMMON_FLAGS = -pthread -fPIE -fno-unwind-tables -fno-asynchronous-unwind-tables
+
+CFLAGS ?= -O2
+CFLAGS += $(COMMON_FLAGS)
+
+CXXFLAGS ?= -O2
+CXXFLAGS += $(COMMON_FLAGS) -std=c++20 -fno-exceptions
+CPPFLAGS += -DMOLD_VERSION=\"1.0.0\" -DLIBDIR="\"$(LIBDIR)\""
+LIBS = -pthread -lz -ldl -lm
 
 SRCS=$(wildcard *.cc elf/*.cc macho/*.cc)
 HEADERS=$(wildcard *.h elf/*.h macho/*.h)
 OBJS=$(SRCS:%.cc=out/%.o)
 
-PREFIX ?= /usr/local
-DEST = $(DESTDIR)$(PREFIX)
 DEBUG ?= 0
 LTO ?= 0
 ASAN ?= 0
@@ -31,26 +44,30 @@ ifneq ($(GIT_HASH),)
 endif
 
 ifeq ($(DEBUG), 1)
-  CPPFLAGS += -O0 -g
-else
-  CPPFLAGS += -O2
+  CXXFLAGS += -O0 -g
 endif
 
 ifeq ($(LTO), 1)
-  CPPFLAGS += -flto -O3
+  CXXFLAGS += -flto -O3
   LDFLAGS  += -flto
 endif
 
-ifeq ($(ASAN), 1)
-  CPPFLAGS += -fsanitize=address
-  LDFLAGS  += -fsanitize=address
+# By default, we want to use mimalloc as a memory allocator. mimalloc
+# is disabled when ASAN or TSAN is on, as they are not compatible.
+# It's also disabled on macOS and Android because it didn't work on
+# those hosts.
+USE_MIMALLOC = 1
+ifeq ($(OS), Darwin)
+  USE_MIMALLOC = 0
+else ifneq (, $(findstring android, $(shell uname -r)))
+  USE_MIMALLOC = 0
+else ifeq ($(ASAN), 1)
+  USE_MIMALLOC = 0
 else ifeq ($(TSAN), 1)
-  CPPFLAGS += -fsanitize=thread
-  LDFLAGS  += -fsanitize=thread
-else ifneq ($(OS), Darwin)
-  # By default, we want to use mimalloc as a memory allocator.
-  # Since replacing the standard malloc is not compatible with ASAN,
-  # we do that only when ASAN is not enabled.
+  USE_MIMALLOC = 0
+endif
+
+ifeq ($(USE_MIMALLOC), 1)
   ifdef SYSTEM_MIMALLOC
     LIBS += -lmimalloc
   else
@@ -58,6 +75,23 @@ else ifneq ($(OS), Darwin)
     CPPFLAGS += -Ithird-party/mimalloc/include
     LIBS += -Wl,-whole-archive $(MIMALLOC_LIB) -Wl,-no-whole-archive
   endif
+endif
+
+ifeq ($(ASAN), 1)
+  CXXFLAGS += -fsanitize=address
+  LDFLAGS  += -fsanitize=address
+endif
+
+ifeq ($(TSAN), 1)
+  CXXFLAGS += -fsanitize=thread
+  LDFLAGS  += -fsanitize=thread
+endif
+
+# Homebrew on macOS/ARM installs packages under /opt/homebrew
+# instead of /usr/local
+ifneq ($(wildcard /opt/homebrew/.),)
+  CPPFLAGS += -I/opt/homebrew/include
+  LIBS += -L/opt/homebrew/lib
 endif
 
 ifdef SYSTEM_TBB
@@ -68,22 +102,35 @@ else
   CPPFLAGS += -Ithird-party/tbb/include
 endif
 
+ifdef SYSTEM_XXHASH
+  LIBS += -lxxhash
+else
+  XXHASH_LIB = third-party/xxhash/libxxhash.a
+  LIBS += $(XXHASH_LIB)
+  CPPFLAGS += -Ithird-party/xxhash
+endif
+
+ifeq ($(OS), Linux)
+  # glibc versions before 2.17 need librt for clock_gettime
+  LIBS += -lrt
+endif
+
 ifneq ($(OS), Darwin)
   LIBS += -lcrypto
 endif
 
 all: mold mold-wrapper.so
 
-mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB)
-	$(CXX) $(CPPFLAGS) $(OBJS) -o $@ $(LDFLAGS) $(LIBS)
+mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB) $(XXHASH_LIB)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) $(EXTRA_LDFLAGS) $(OBJS) -o $@ $(LIBS)
 	ln -sf mold ld
 	ln -sf mold ld64.mold
 
 mold-wrapper.so: elf/mold-wrapper.c Makefile
-	$(CC) -fPIC -shared -o $@ $< -ldl
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared -o $@ $(LDFLAGS) $< -ldl
 
 out/%.o: %.cc $(HEADERS) Makefile out/elf/.keep out/macho/.keep
-	$(CXX) $(CPPFLAGS) -c -o $@ $<
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
 
 out/elf/.keep:
 	mkdir -p out/elf
@@ -104,37 +151,47 @@ $(TBB_LIB):
 	$(MAKE) -C out/tbb tbb
 	(cd out/tbb; ln -sf *_relwithdebinfo libs)
 
-ifeq ($(OS), Darwin)
+$(XXHASH_LIB):
+	$(MAKE) -C third-party/xxhash libxxhash.a
+
 test tests check: all
+ifeq ($(OS), Darwin)
 	$(MAKE) -C test -f Makefile.darwin --no-print-directory
 else
-test tests check: all
 	$(MAKE) -C test -f Makefile.linux --no-print-directory --output-sync
 endif
 
+	@if test -t 1; then \
+	  printf '\e[32mPassed all tests\e[0m\n'; \
+	else \
+	  echo 'Passed all tests'; \
+	fi
+
 install: all
-	install -m 755 -d $(DEST)/bin
-	install -m 755 mold $(DEST)/bin
-	strip $(DEST)/bin/mold
+	install -m 755 -d $D$(BINDIR)
+	install -m 755 mold $D$(BINDIR)
+	$(STRIP) $D$(BINDIR)/mold
 
-	install -m 755 -d $(DEST)/lib/mold
-	install -m 644 mold-wrapper.so $(DEST)/lib/mold
-	strip $(DEST)/lib/mold/mold-wrapper.so
+	install -m 755 -d $D$(LIBDIR)/mold
+	install -m 644 mold-wrapper.so $D$(LIBDIR)/mold
+	$(STRIP) $D$(LIBDIR)/mold/mold-wrapper.so
 
-	install -m 755 -d $(DEST)/share/man/man1
-	install -m 644 docs/mold.1 $(DEST)/share/man/man1
-	rm -f $(DEST)/share/man/man1/mold.1.gz
-	gzip -9 $(DEST)/share/man/man1/mold.1
+	install -m 755 -d $D$(LIBEXECDIR)/mold
+	ln -sf $(BINDIR)/mold $D$(LIBEXECDIR)/mold/ld
 
-	ln -sf mold $(DEST)/bin/ld.mold
-	ln -sf mold $(DEST)/bin/ld64.mold
+	install -m 755 -d $D$(MANDIR)/man1
+	install -m 644 docs/mold.1 $D$(MANDIR)/man1
+
+	ln -sf mold $D$(BINDIR)/ld.mold
+	ln -sf mold $D$(BINDIR)/ld64.mold
 
 uninstall:
-	rm -f $(DEST)/bin/mold $(DEST)/bin/ld.mold $(DEST)/bin/ld64.mold
-	rm -f $(DEST)/share/man/man1/mold.1.gz
-	rm -rf $(DEST)/lib/mold
+	rm -f $D$(BINDIR)/mold $D$(BINDIR)/ld.mold $D$(BINDIR)/ld64.mold
+	rm -f $D$(MANDIR)/man1/mold.1
+	rm -rf $D$(LIBDIR)/mold
 
 clean:
 	rm -rf *~ mold mold-wrapper.so out ld ld64.mold
+	$(MAKE) -C third-party/xxhash clean
 
 .PHONY: all test tests check clean

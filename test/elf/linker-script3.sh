@@ -1,21 +1,23 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
-mkdir -p $t
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t="$(pwd)/out/test/elf/$testname"
+mkdir -p "$t"
 
-mkdir -p $t/foo
+mkdir -p "$t"/foo
 
-cat <<EOF | cc -o $t/foo/a.o -c -xc -
+cat <<EOF | cc -o "$t"/foo/a.o -c -xc -
 int main() {}
 EOF
 
-cat <<EOF > $t/b.script
+cat <<EOF > "$t"/b.script
 INPUT(a.o)
 EOF
 
-clang -o $t/exe -L$t/foo $t/b.script
+clang -o "$t"/exe -L"$t"/foo "$t"/b.script
 
 echo OK

@@ -1,12 +1,14 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
-mkdir -p $t
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t="$(pwd)/out/test/elf/$testname"
+mkdir -p "$t"
 
-cat <<EOF | clang -c -o $t/a.o -xc -
+cat <<EOF | clang -c -o "$t"/a.o -xc -
 #include <stdio.h>
 
 int main() {
@@ -15,6 +17,6 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold $t/a.o -o $t/exe -static -Wl,--omagic
+clang -fuse-ld="$mold" "$t"/a.o -o "$t"/exe -static -Wl,--omagic
 
 echo OK

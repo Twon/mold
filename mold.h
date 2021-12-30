@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <span>
@@ -102,7 +103,11 @@ template <typename C>
 class Error {
 public:
   Error(C &ctx) : out(ctx, std::cerr) {
-    out << "mold: ";
+    if (ctx.arg.color_diagnostics)
+      out << "mold: \033[0;1;31merror:\033[0m ";
+    else
+      out << "mold: error: ";
+
     ctx.has_error = true;
   }
 
@@ -119,9 +124,18 @@ template <typename C>
 class Warn {
 public:
   Warn(C &ctx) : out(ctx, std::cerr) {
-    out << "mold: ";
-    if (ctx.arg.fatal_warnings)
+    if (ctx.arg.fatal_warnings) {
+      if (ctx.arg.color_diagnostics)
+        out << "mold: \033[0;1;31merror:\033[0m ";
+      else
+        out << "mold: error: ";
       ctx.has_error = true;
+    } else {
+      if (ctx.arg.color_diagnostics)
+        out << "mold: \033[0;1;35mwarning:\033[0m ";
+      else
+        out << "mold: warning: ";
+    }
   }
 
   template <class T> Warn &operator<<(T &&val) {
@@ -418,13 +432,19 @@ private:
 // filepath.cc
 //
 
-// These are various utility functions to deal with file pathnames.
-std::string get_current_dir();
-std::string_view path_dirname(std::string_view path);
-std::string_view path_filename(std::string_view path);
-std::string_view path_basename(std::string_view path);
-std::string path_to_absolute(std::string_view path);
+template <typename T>
+std::filesystem::path filepath(const T &path) {
+#if __APPLE__
+  // Xcode 13.1 does not seem to define `generic_format`.
+  return {path};
+#else
+  return {path, std::filesystem::path::generic_format};
+#endif
+}
+
+std::string get_realpath(std::string_view path);
 std::string path_clean(std::string_view path);
+std::filesystem::path to_abs_path(std::filesystem::path path);
 
 //
 // demangle.cc
@@ -524,6 +544,8 @@ public:
     ctx.timer_records.push_back(std::unique_ptr<TimerRecord>(record));
   }
 
+  Timer(const Timer &) = delete;
+
   ~Timer() {
     record->stop();
   }
@@ -580,14 +602,6 @@ public:
 
   std::string_view get_contents() {
     return std::string_view((char *)data, size);
-  }
-
-  bool write_to(std::string path) {
-    FILE *fp = fopen(path.c_str(), "w");
-    if (!fp)
-      return false;
-    fwrite(data, size, 1, fp);
-    return true;
   }
 
   std::string name;

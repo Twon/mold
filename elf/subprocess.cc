@@ -1,5 +1,6 @@
 #include "mold.h"
 
+#include <filesystem>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -249,15 +250,8 @@ void daemonize(Context<E> &ctx, std::function<void()> *wait_for_client,
   };
 }
 
-template <typename E>
-static std::string get_self_path(Context<E> &ctx) {
-  char buf[4096];
-  size_t n = readlink("/proc/self/exe", buf, sizeof(buf));
-  if (n == -1)
-    Fatal(ctx) << "readlink(\"/proc/self/exe\") failed: " << errno_string();
-  if (n == sizeof(buf))
-    Fatal(ctx) << "readlink: path too long";
-  return {buf, n};
+static std::string get_self_path() {
+  return std::filesystem::read_symlink("/proc/self/exe");
 }
 
 static bool is_regular_file(const std::string &path) {
@@ -266,17 +260,20 @@ static bool is_regular_file(const std::string &path) {
 }
 
 template <typename E>
-std::string find_dso(Context<E> &ctx, const std::string &self) {
+std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
   // Look for mold-wrapper.so from the same directory as the executable is.
-  std::string path = std::string(path_dirname(self)) + "/mold-wrapper.so";
-  if (is_regular_file(path))
+  std::filesystem::path path = self.parent_path() / "mold-wrapper.so";
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(path, ec) && !ec)
     return path;
 
-  // If not exist, mold might be installed as $PREFIX/bin/mold and the
-  // DSO as $PREFIX/lib/mold/mold-wrapper.so.
-  path = path_clean(self + "/../../lib/mold/mold-wrapper.so");
-  if (is_regular_file(path))
+#ifdef LIBDIR
+  // If not found, search $(LIBDIR)/mold, which is /usr/local/lib/mold
+  // by default.
+  path = LIBDIR "/mold/mold-wrapper.so";
+  if (std::filesystem::is_regular_file(path, ec) && !ec)
     return path;
+#endif
 
   Fatal(ctx) << "mold-wrapper.so is missing";
 }
@@ -290,7 +287,7 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
     Fatal(ctx) << "-run: argument missing";
 
   // Get the mold-wrapper.so path
-  std::string self = get_self_path(ctx);
+  std::string self = get_self_path();
   std::string dso_path = find_dso(ctx, self);
 
   // Set environment variables
@@ -298,7 +295,7 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
   putenv(strdup(("MOLD_PATH=" + self).c_str()));
 
   // If ld, ld.lld or ld.gold is specified, run mold itself
-  if (std::string_view cmd = path_basename(argv[2]);
+  if (std::string cmd = filepath(argv[2]).filename();
       cmd == "ld" || cmd == "ld.lld" || cmd == "ld.gold") {
     std::vector<char *> args;
     args.push_back(argv[0]);
@@ -320,6 +317,6 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
-INSTANTIATE(AARCH64);
+INSTANTIATE(ARM64);
 
 } // namespace mold::elf

@@ -39,7 +39,7 @@ void OutputEhdr<E>::copy_buf(Context<E> &ctx) {
   memset(&hdr, 0, sizeof(hdr));
 
   memcpy(&hdr.e_ident, "\177ELF", 4);
-  hdr.e_ident[EI_CLASS] = (E::wordsize == 8) ? ELFCLASS64 : ELFCLASS32;
+  hdr.e_ident[EI_CLASS] = (E::word_size == 8) ? ELFCLASS64 : ELFCLASS32;
   hdr.e_ident[EI_DATA] = E::is_le ? ELFDATA2LSB : ELFDATA2MSB;
   hdr.e_ident[EI_VERSION] = EV_CURRENT;
   hdr.e_type = ctx.arg.pic ? ET_DYN : ET_EXEC;
@@ -76,11 +76,12 @@ void OutputShdr<E>::copy_buf(Context<E> &ctx) {
 }
 
 template <typename E>
-static i64 to_phdr_flags(Chunk<E> *chunk) {
+static i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk) {
   i64 ret = PF_R;
   if (chunk->shdr.sh_flags & SHF_WRITE)
     ret |= PF_W;
-  if (chunk->shdr.sh_flags & SHF_EXECINSTR)
+  if ((chunk->shdr.sh_flags & SHF_EXECINSTR) ||
+      (ctx.arg.z_separate_code == NOSEPARATE_CODE))
     ret |= PF_X;
   return ret;
 }
@@ -114,6 +115,22 @@ bool is_relro(Context<E> &ctx, Chunk<E> *chunk) {
 }
 
 template <typename E>
+bool separate_page(Context<E> &ctx, Chunk<E> *x, Chunk<E> *y) {
+  if (ctx.arg.z_relro && is_relro(ctx, x) != is_relro(ctx, y))
+    return true;
+
+  switch (ctx.arg.z_separate_code) {
+  case SEPARATE_LOADABLE_SEGMENTS:
+    return to_phdr_flags(ctx, x) != to_phdr_flags(ctx, y);
+  case SEPARATE_CODE:
+    return (x->shdr.sh_flags & SHF_EXECINSTR) != (y->shdr.sh_flags & SHF_EXECINSTR);
+  case NOSEPARATE_CODE:
+    return false;
+  }
+  unreachable();
+}
+
+template <typename E>
 std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   std::vector<ElfPhdr<E>> vec;
 
@@ -134,9 +151,8 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   auto append = [&](Chunk<E> *chunk) {
     ElfPhdr<E> &phdr = vec.back();
     phdr.p_align = std::max<u64>(phdr.p_align, chunk->shdr.sh_addralign);
-    phdr.p_filesz = (chunk->shdr.sh_type == SHT_NOBITS)
-      ? chunk->shdr.sh_offset - phdr.p_offset
-      : chunk->shdr.sh_offset + chunk->shdr.sh_size - phdr.p_offset;
+    if (!(chunk->shdr.sh_type == SHT_NOBITS))
+      phdr.p_filesz = chunk->shdr.sh_addr + chunk->shdr.sh_size - phdr.p_vaddr;
     phdr.p_memsz = chunk->shdr.sh_addr + chunk->shdr.sh_size - phdr.p_vaddr;
   };
 
@@ -145,8 +161,18 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
            !(chunk->shdr.sh_flags & SHF_TLS);
   };
 
+  auto is_tbss = [](Chunk<E> *chunk) {
+    return chunk->shdr.sh_type == SHT_NOBITS &&
+           (chunk->shdr.sh_flags & SHF_TLS);
+  };
+
+  auto is_note = [](Chunk<E> *chunk) {
+    ElfShdr<E> &shdr = chunk->shdr;
+    return (shdr.sh_type == SHT_NOTE) && (shdr.sh_flags & SHF_ALLOC);
+  };
+
   // Create a PT_PHDR for the program header itself.
-  define(PT_PHDR, PF_R, E::wordsize, ctx.phdr);
+  define(PT_PHDR, PF_R, E::word_size, ctx.phdr);
 
   // Create a PT_INTERP.
   if (ctx.interp)
@@ -156,40 +182,41 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   // alignment requirement.
   for (i64 i = 0, end = ctx.chunks.size(); i < end;) {
     Chunk<E> *first = ctx.chunks[i++];
-    if (first->shdr.sh_type != SHT_NOTE)
+    if (!is_note(first))
       continue;
 
-    i64 flags = to_phdr_flags(first);
+    i64 flags = to_phdr_flags(ctx, first);
     i64 alignment = first->shdr.sh_addralign;
     define(PT_NOTE, flags, alignment, first);
 
-    while (i < end && ctx.chunks[i]->shdr.sh_type == SHT_NOTE &&
-           to_phdr_flags(ctx.chunks[i]) == flags &&
+    while (i < end && is_note(ctx.chunks[i]) &&
+           to_phdr_flags(ctx, ctx.chunks[i]) == flags &&
            ctx.chunks[i]->shdr.sh_addralign == alignment)
       append(ctx.chunks[i++]);
   }
 
   // Create PT_LOAD segments.
-  for (Chunk<E> *chunk : ctx.chunks)
-    chunk->new_page = false;
+  {
+    std::vector<Chunk<E> *> chunks = ctx.chunks;
+    erase(chunks, is_tbss);
 
-  for (i64 i = 0, end = ctx.chunks.size(); i < end;) {
-    Chunk<E> *first = ctx.chunks[i++];
-    if (!(first->shdr.sh_flags & SHF_ALLOC))
-      break;
+    for (i64 i = 0, end = chunks.size(); i < end;) {
+      Chunk<E> *first = chunks[i++];
+      if (!(first->shdr.sh_flags & SHF_ALLOC))
+        break;
 
-    i64 flags = to_phdr_flags(first);
-    define(PT_LOAD, flags, COMMON_PAGE_SIZE, first);
-    first->new_page = true;
+      i64 flags = to_phdr_flags(ctx, first);
+      define(PT_LOAD, flags, ctx.page_size, first);
 
-    if (!is_bss(first))
-      while (i < end && !is_bss(ctx.chunks[i]) &&
-             to_phdr_flags(ctx.chunks[i]) == flags)
-        append(ctx.chunks[i++]);
+      if (!is_bss(first))
+        while (i < end && !is_bss(chunks[i]) &&
+               to_phdr_flags(ctx, chunks[i]) == flags)
+          append(chunks[i++]);
 
-    while (i < end && is_bss(ctx.chunks[i]) &&
-           to_phdr_flags(ctx.chunks[i]) == flags)
-      append(ctx.chunks[i++]);
+      while (i < end && is_bss(chunks[i]) &&
+             to_phdr_flags(ctx, chunks[i]) == flags)
+        append(chunks[i++]);
+    }
   }
 
   // Create a PT_TLS.
@@ -197,7 +224,7 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
     if (!(ctx.chunks[i]->shdr.sh_flags & SHF_TLS))
       continue;
 
-    define(PT_TLS, to_phdr_flags(ctx.chunks[i]), 1, ctx.chunks[i]);
+    define(PT_TLS, to_phdr_flags(ctx, ctx.chunks[i]), 1, ctx.chunks[i]);
     i++;
     while (i < ctx.chunks.size() && (ctx.chunks[i]->shdr.sh_flags & SHF_TLS))
       append(ctx.chunks[i++]);
@@ -225,12 +252,9 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
         continue;
 
       define(PT_GNU_RELRO, PF_R, 1, ctx.chunks[i]);
-      ctx.chunks[i]->new_page = true;
       i++;
       while (i < ctx.chunks.size() && is_relro(ctx, ctx.chunks[i]))
         append(ctx.chunks[i++]);
-      if (i < ctx.chunks.size())
-        ctx.chunks[i]->new_page = true;
     }
   }
 
@@ -244,7 +268,9 @@ void OutputPhdr<E>::update_shdr(Context<E> &ctx) {
 
 template <typename E>
 void OutputPhdr<E>::copy_buf(Context<E> &ctx) {
-  write_vector(ctx.buf + this->shdr.sh_offset, create_phdr(ctx));
+  std::vector<ElfPhdr<E>> vec = create_phdr(ctx);
+  assert(this->shdr.sh_size == vec.size() * sizeof(ElfPhdr<E>));
+  write_vector(ctx.buf + this->shdr.sh_offset, vec);
 }
 
 template <typename E>
@@ -289,7 +315,7 @@ ElfRel<I386> reloc<I386>(u64 offset, u32 type, u32 sym, i64 addend) {
 }
 
 template <>
-ElfRel<AARCH64> reloc<AARCH64>(u64 offset, u32 type, u32 sym, i64 addend) {
+ElfRel<ARM64> reloc<ARM64>(u64 offset, u32 type, u32 sym, i64 addend) {
   return {offset, type, sym, addend};
 }
 
@@ -552,6 +578,8 @@ static std::vector<typename E::WordTy> create_dynamic_section(Context<E> &ctx) {
 
   if (!ctx.arg.z_dlopen)
     flags1 |= DF_1_NOOPEN;
+  if (ctx.arg.z_nodefaultlib)
+    flags1 |= DF_1_NODEFLIB;
   if (!ctx.arg.z_delete)
     flags1 |= DF_1_NODELETE;
   if (!ctx.arg.z_dump)
@@ -587,7 +615,7 @@ void DynamicSection<E>::update_shdr(Context<E> &ctx) {
   if (!ctx.arg.pic && ctx.dsos.empty())
     return;
 
-  this->shdr.sh_size = create_dynamic_section(ctx).size() * E::wordsize;
+  this->shdr.sh_size = create_dynamic_section(ctx).size() * E::word_size;
   this->shdr.sh_link = ctx.dynstr->shndx;
 }
 
@@ -740,8 +768,8 @@ void OutputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
 
 template <typename E>
 void GotSection<E>::add_got_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  sym->set_got_idx(ctx, this->shdr.sh_size / E::wordsize);
-  this->shdr.sh_size += E::wordsize;
+  sym->set_got_idx(ctx, this->shdr.sh_size / E::word_size);
+  this->shdr.sh_size += E::word_size;
   got_syms.push_back(sym);
 
   if (sym->is_imported)
@@ -750,8 +778,8 @@ void GotSection<E>::add_got_symbol(Context<E> &ctx, Symbol<E> *sym) {
 
 template <typename E>
 void GotSection<E>::add_gottp_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  sym->set_gottp_idx(ctx, this->shdr.sh_size / E::wordsize);
-  this->shdr.sh_size += E::wordsize;
+  sym->set_gottp_idx(ctx, this->shdr.sh_size / E::word_size);
+  this->shdr.sh_size += E::word_size;
   gottp_syms.push_back(sym);
 
   if (sym->is_imported)
@@ -760,16 +788,16 @@ void GotSection<E>::add_gottp_symbol(Context<E> &ctx, Symbol<E> *sym) {
 
 template <typename E>
 void GotSection<E>::add_tlsgd_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  sym->set_tlsgd_idx(ctx, this->shdr.sh_size / E::wordsize);
-  this->shdr.sh_size += E::wordsize * 2;
+  sym->set_tlsgd_idx(ctx, this->shdr.sh_size / E::word_size);
+  this->shdr.sh_size += E::word_size * 2;
   tlsgd_syms.push_back(sym);
   ctx.dynsym->add_symbol(ctx, sym);
 }
 
 template <typename E>
 void GotSection<E>::add_tlsdesc_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  sym->set_tlsdesc_idx(ctx, this->shdr.sh_size / E::wordsize);
-  this->shdr.sh_size += E::wordsize * 2;
+  sym->set_tlsdesc_idx(ctx, this->shdr.sh_size / E::word_size);
+  this->shdr.sh_size += E::word_size * 2;
   tlsdesc_syms.push_back(sym);
   ctx.dynsym->add_symbol(ctx, sym);
 }
@@ -778,14 +806,14 @@ template <typename E>
 void GotSection<E>::add_tlsld(Context<E> &ctx) {
   if (tlsld_idx != -1)
     return;
-  tlsld_idx = this->shdr.sh_size / E::wordsize;
-  this->shdr.sh_size += E::wordsize * 2;
+  tlsld_idx = this->shdr.sh_size / E::word_size;
+  this->shdr.sh_size += E::word_size * 2;
 }
 
 template <typename E>
 u64 GotSection<E>::get_tlsld_addr(Context<E> &ctx) const {
   assert(tlsld_idx != -1);
-  return this->shdr.sh_addr + tlsld_idx * E::wordsize;
+  return this->shdr.sh_addr + tlsld_idx * E::word_size;
 }
 
 template <typename E>
@@ -800,7 +828,7 @@ i64 GotSection<E>::get_reldyn_size(Context<E> &ctx) const {
   n += tlsdesc_syms.size();
 
   for (Symbol<E> *sym : gottp_syms)
-    if (sym->is_imported)
+    if (sym->is_imported || ctx.arg.shared)
       n++;
 
   if (tlsld_idx != -1)
@@ -839,7 +867,7 @@ void GotSection<E>::copy_buf(Context<E> &ctx) {
     u64 addr = sym->get_tlsgd_addr(ctx);
     i32 dynsym_idx = sym->get_dynsym_idx(ctx);
     *rel++ = reloc<E>(addr, E::R_DTPMOD, dynsym_idx);
-    *rel++ = reloc<E>(addr + E::wordsize, E::R_DTPOFF, dynsym_idx);
+    *rel++ = reloc<E>(addr + E::word_size, E::R_DTPOFF, dynsym_idx);
   }
 
   for (Symbol<E> *sym : tlsdesc_syms)
@@ -850,6 +878,9 @@ void GotSection<E>::copy_buf(Context<E> &ctx) {
     if (sym->is_imported) {
       *rel++ = reloc<E>(sym->get_gottp_addr(ctx), E::R_TPOFF,
                         sym->get_dynsym_idx(ctx));
+    } else if (ctx.arg.shared) {
+      *rel++ = reloc<E>(sym->get_gottp_addr(ctx), E::R_TPOFF, 0,
+                        sym->get_addr(ctx) - ctx.tls_begin);
     } else if (E::e_machine == EM_386 || E::e_machine == EM_X86_64) {
       buf[sym->get_gottp_idx(ctx)] = sym->get_addr(ctx) - ctx.tls_end;
     } else {
@@ -868,15 +899,15 @@ void PltSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
 
   if (this->shdr.sh_size == 0) {
     this->shdr.sh_size = E::plt_hdr_size;
-    ctx.gotplt->shdr.sh_size = E::wordsize * 3;
+    ctx.gotplt->shdr.sh_size = E::word_size * 3;
   }
 
   sym->set_plt_idx(ctx, this->shdr.sh_size / E::plt_size);
   this->shdr.sh_size += E::plt_size;
   symbols.push_back(sym);
 
-  sym->set_gotplt_idx(ctx, ctx.gotplt->shdr.sh_size / E::wordsize);
-  ctx.gotplt->shdr.sh_size += E::wordsize;
+  sym->set_gotplt_idx(ctx, ctx.gotplt->shdr.sh_size / E::word_size);
+  ctx.gotplt->shdr.sh_size += E::word_size;
   ctx.relplt->shdr.sh_size += sizeof(ElfRel<E>);
   ctx.dynsym->add_symbol(ctx, sym);
 }
@@ -1008,7 +1039,7 @@ void DynsymSection<E>::copy_buf(Context<E> &ctx) {
     } else if (sym.file->is_dso || sym.esym().is_undef()) {
       esym.st_shndx = SHN_UNDEF;
       esym.st_size = 0;
-      if (sym.has_plt(ctx) && !ctx.arg.pic) {
+      if (sym.has_plt(ctx) && !ctx.arg.pic && sym.is_imported) {
         // Emit an address for a canonical PLT
         esym.st_value = sym.get_plt_addr(ctx);
       }
@@ -1072,7 +1103,7 @@ void GnuHashSection<E>::update_shdr(Context<E> &ctx) {
   }
 
   this->shdr.sh_size = HEADER_SIZE;              // Header
-  this->shdr.sh_size += num_bloom * E::wordsize; // Bloom filter
+  this->shdr.sh_size += num_bloom * E::word_size; // Bloom filter
   this->shdr.sh_size += num_buckets * 4;         // Hash buckets
   this->shdr.sh_size += num_globals * 4;         // Hash values
 }
@@ -1139,7 +1170,6 @@ MergedSection<E> *
 MergedSection<E>::get_instance(Context<E> &ctx, std::string_view name,
                                u64 type, u64 flags) {
   name = get_output_name(ctx, name);
-  flags = flags & ~(u64)SHF_MERGE & ~(u64)SHF_STRINGS;
 
   auto find = [&]() -> MergedSection * {
     for (std::unique_ptr<MergedSection<E>> &osec : ctx.merged_sections)
@@ -1168,7 +1198,7 @@ MergedSection<E>::get_instance(Context<E> &ctx, std::string_view name,
 }
 
 template <typename E>
-Subsection<E> *
+SectionFragment<E> *
 MergedSection<E>::insert(std::string_view data, u64 hash, i64 alignment) {
   assert(alignment < UINT16_MAX);
 
@@ -1177,15 +1207,15 @@ MergedSection<E>::insert(std::string_view data, u64 hash, i64 alignment) {
     map.resize(estimator.get_cardinality() * 3 / 2);
   });
 
-  Subsection<E> *subsec;
+  SectionFragment<E> *frag;
   bool inserted;
-  std::tie(subsec, inserted) = map.insert(data, hash, Subsection(this));
-  assert(subsec);
+  std::tie(frag, inserted) = map.insert(data, hash, SectionFragment(this));
+  assert(frag);
 
-  for (u16 cur = subsec->alignment; cur < alignment;)
-    if (subsec->alignment.compare_exchange_weak(cur, alignment))
+  for (u16 cur = frag->alignment; cur < alignment;)
+    if (frag->alignment.compare_exchange_weak(cur, alignment))
       break;
-  return subsec;
+  return frag;
 }
 
 template <typename E>
@@ -1199,18 +1229,18 @@ void MergedSection<E>::assign_offsets(Context<E> &ctx) {
   tbb::parallel_for((i64)0, map.NUM_SHARDS, [&](i64 i) {
     struct KeyVal {
       std::string_view key;
-      Subsection<E> *val;
+      SectionFragment<E> *val;
     };
 
-    std::vector<KeyVal> subsections;
-    subsections.reserve(shard_size);
+    std::vector<KeyVal> fragments;
+    fragments.reserve(shard_size);
 
     for (i64 j = shard_size * i; j < shard_size * (i + 1); j++)
-      if (Subsection<E> &subsec = map.values[j]; subsec.is_alive)
-        subsections.push_back({{map.keys[j], map.sizes[j]}, &subsec});
+      if (SectionFragment<E> &frag = map.values[j]; frag.is_alive)
+        fragments.push_back({{map.keys[j], map.sizes[j]}, &frag});
 
-    // Sort subsections to make output deterministic.
-    tbb::parallel_sort(subsections.begin(), subsections.end(),
+    // Sort fragments to make output deterministic.
+    tbb::parallel_sort(fragments.begin(), fragments.end(),
                        [](const KeyVal &a, const KeyVal &b) {
       if (a.val->alignment != b.val->alignment)
         return a.val->alignment < b.val->alignment;
@@ -1223,19 +1253,19 @@ void MergedSection<E>::assign_offsets(Context<E> &ctx) {
     i64 offset = 0;
     i64 max_alignment = 0;
 
-    for (KeyVal &kv : subsections) {
-      Subsection<E> &subsec = *kv.val;
-      offset = align_to(offset, subsec.alignment);
-      subsec.offset = offset;
+    for (KeyVal &kv : fragments) {
+      SectionFragment<E> &frag = *kv.val;
+      offset = align_to(offset, frag.alignment);
+      frag.offset = offset;
       offset += kv.key.size();
-      max_alignment = std::max<i64>(max_alignment, subsec.alignment);
+      max_alignment = std::max<i64>(max_alignment, frag.alignment);
     }
 
     sizes[i] = offset;
     max_alignments[i] = max_alignment;
 
     static Counter merged_strings("merged_strings");
-    merged_strings += subsections.size();
+    merged_strings += fragments.size();
   });
 
   i64 alignment = 1;
@@ -1248,8 +1278,8 @@ void MergedSection<E>::assign_offsets(Context<E> &ctx) {
 
   tbb::parallel_for((i64)1, map.NUM_SHARDS, [&](i64 i) {
     for (i64 j = shard_size * i; j < shard_size * (i + 1); j++)
-      if (Subsection<E> &subsec = map.values[j]; subsec.is_alive)
-        subsec.offset += shard_offsets[i];
+      if (SectionFragment<E> &frag = map.values[j]; frag.is_alive)
+        frag.offset += shard_offsets[i];
   });
 
   this->shdr.sh_size = shard_offsets[map.NUM_SHARDS];
@@ -1269,8 +1299,8 @@ void MergedSection<E>::write_to(Context<E> &ctx, u8 *buf) {
     memset(buf + shard_offsets[i], 0, shard_offsets[i + 1] - shard_offsets[i]);
 
     for (i64 j = shard_size * i; j < shard_size * (i + 1); j++)
-      if (Subsection<E> &subsec = map.values[j]; subsec.is_alive)
-        memcpy(buf + subsec.offset, map.keys[j], map.sizes[j]);
+      if (SectionFragment<E> &frag = map.values[j]; frag.is_alive)
+        memcpy(buf + frag.offset, map.keys[j], map.sizes[j]);
   });
 }
 
@@ -1724,7 +1754,7 @@ void NotePropertySection<E>::update_shdr(Context<E> &ctx) {
       features &= file->features;
 
   if (features != 0 && features != -1)
-    this->shdr.sh_size = (E::wordsize == 8) ? 32 : 28;
+    this->shdr.sh_size = (E::word_size == 8) ? 32 : 28;
 }
 
 template <typename E>
@@ -1733,7 +1763,7 @@ void NotePropertySection<E>::copy_buf(Context<E> &ctx) {
   memset(buf, 0, this->shdr.sh_size);
 
   buf[0] = 4;                              // Name size
-  buf[1] = (E::wordsize == 8) ? 16 : 12;   // Content size
+  buf[1] = (E::word_size == 8) ? 16 : 12;   // Content size
   buf[2] = NT_GNU_PROPERTY_TYPE_0;         // Type
   memcpy(buf + 3, "GNU", 4);               // Name
   buf[4] = GNU_PROPERTY_X86_FEATURE_1_AND; // Feature type
@@ -1808,7 +1838,7 @@ void ReproSection<E>::update_shdr(Context<E> &ctx) {
 
   std::unordered_set<std::string> seen;
   for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool) {
-    std::string path = path_to_absolute(mf->name);
+    std::string path = to_abs_path(mf->name);
     if (seen.insert(path).second)
       tar.append(path, mf->get_contents());
   }
@@ -1824,45 +1854,46 @@ void ReproSection<E>::copy_buf(Context<E> &ctx) {
   contents->write_to(ctx.buf + this->shdr.sh_offset);
 }
 
-#define INSTANTIATE(E)                                          \
-  template class Chunk<E>;                                      \
-  template class OutputEhdr<E>;                                 \
-  template class OutputShdr<E>;                                 \
-  template class OutputPhdr<E>;                                 \
-  template class InterpSection<E>;                              \
-  template class OutputSection<E>;                              \
-  template class GotSection<E>;                                 \
-  template class GotPltSection<E>;                              \
-  template class PltSection<E>;                                 \
-  template class PltGotSection<E>;                              \
-  template class RelPltSection<E>;                              \
-  template class RelDynSection<E>;                              \
-  template class StrtabSection<E>;                              \
-  template class ShstrtabSection<E>;                            \
-  template class DynstrSection<E>;                              \
-  template class DynamicSection<E>;                             \
-  template class SymtabSection<E>;                              \
-  template class DynsymSection<E>;                              \
-  template class HashSection<E>;                                \
-  template class GnuHashSection<E>;                             \
-  template class MergedSection<E>;                              \
-  template class EhFrameSection<E>;                             \
-  template class EhFrameHdrSection<E>;                          \
-  template class DynbssSection<E>;                              \
-  template class VersymSection<E>;                              \
-  template class VerneedSection<E>;                             \
-  template class VerdefSection<E>;                              \
-  template class BuildIdSection<E>;                             \
-  template class NotePropertySection<E>;                        \
-  template class GabiCompressedSection<E>;                      \
-  template class GnuCompressedSection<E>;                       \
-  template class ReproSection<E>;                               \
-  template i64 BuildId::size(Context<E> &) const;               \
-  template bool is_relro(Context<E> &, Chunk<E> *);             \
+#define INSTANTIATE(E)                                                  \
+  template class Chunk<E>;                                              \
+  template class OutputEhdr<E>;                                         \
+  template class OutputShdr<E>;                                         \
+  template class OutputPhdr<E>;                                         \
+  template class InterpSection<E>;                                      \
+  template class OutputSection<E>;                                      \
+  template class GotSection<E>;                                         \
+  template class GotPltSection<E>;                                      \
+  template class PltSection<E>;                                         \
+  template class PltGotSection<E>;                                      \
+  template class RelPltSection<E>;                                      \
+  template class RelDynSection<E>;                                      \
+  template class StrtabSection<E>;                                      \
+  template class ShstrtabSection<E>;                                    \
+  template class DynstrSection<E>;                                      \
+  template class DynamicSection<E>;                                     \
+  template class SymtabSection<E>;                                      \
+  template class DynsymSection<E>;                                      \
+  template class HashSection<E>;                                        \
+  template class GnuHashSection<E>;                                     \
+  template class MergedSection<E>;                                      \
+  template class EhFrameSection<E>;                                     \
+  template class EhFrameHdrSection<E>;                                  \
+  template class DynbssSection<E>;                                      \
+  template class VersymSection<E>;                                      \
+  template class VerneedSection<E>;                                     \
+  template class VerdefSection<E>;                                      \
+  template class BuildIdSection<E>;                                     \
+  template class NotePropertySection<E>;                                \
+  template class GabiCompressedSection<E>;                              \
+  template class GnuCompressedSection<E>;                               \
+  template class ReproSection<E>;                                       \
+  template i64 BuildId::size(Context<E> &) const;                       \
+  template bool is_relro(Context<E> &, Chunk<E> *);                     \
+  template bool separate_page(Context<E> &, Chunk<E> *, Chunk<E> *);    \
   template std::vector<ElfPhdr<E>> create_phdr(Context<E> &)
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
-INSTANTIATE(AARCH64);
+INSTANTIATE(ARM64);
 
 } // namespace mold::elf

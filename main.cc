@@ -12,10 +12,11 @@ std::string_view errno_string() {
   return buf;
 }
 
-const std::string mold_version =
 #ifdef GIT_HASH
+const std::string mold_version =
   "mold " MOLD_VERSION " (" GIT_HASH "; compatible with GNU ld and GNU gold)";
 #else
+const std::string mold_version =
   "mold " MOLD_VERSION " (compatible with GNU ld and GNU gold)";
 #endif
 
@@ -39,14 +40,10 @@ void install_signal_handler() {
 } // namespace mold
 
 int main(int argc, char **argv) {
-  std::string_view cmd = mold::path_filename(argv[0]);
-
-  if (cmd == "ld" || cmd == "mold" || cmd == "ld.mold")
-    return mold::elf::main(argc, argv);
+  std::string cmd = mold::filepath(argv[0]).filename();
 
   if (cmd == "ld64" || cmd == "ld64.mold")
     return mold::macho::main(argc, argv);
 
-  std::cerr << "mold: unknown command: " << argv[0] << "\n";
-  exit(1);
+  return mold::elf::main(argc, argv);
 }

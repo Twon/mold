@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 #include <regex>
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_scan.h>
@@ -20,11 +21,12 @@ void apply_exclude_libs(Context<E> &ctx) {
   std::unordered_set<std::string_view> set(ctx.arg.exclude_libs.begin(),
                                            ctx.arg.exclude_libs.end());
 
-  for (ObjectFile<E> *file : ctx.objs)
+  for (ObjectFile<E> *file : ctx.objs) {
     if (!file->archive_name.empty())
       if (set.contains("ALL") ||
-          set.contains(path_filename(file->archive_name)))
+          set.contains(filepath(file->archive_name).filename().string()))
         file->exclude_libs = true;
+  }
 }
 
 template <typename E>
@@ -205,21 +207,22 @@ template <typename E>
 void add_comment_string(Context<E> &ctx, std::string str) {
   std::string_view buf = save_string(ctx, str);
   MergedSection<E> *sec =
-    MergedSection<E>::get_instance(ctx, ".comment", SHT_PROGBITS, 0);
+    MergedSection<E>::get_instance(ctx, ".comment", SHT_PROGBITS,
+                                   SHF_MERGE | SHF_STRINGS);
   std::string_view data(buf.data(), buf.size() + 1);
-  Subsection<E> *subsec = sec->insert(data, hash_string(data), 1);
-  subsec->is_alive = true;
+  SectionFragment<E> *frag = sec->insert(data, hash_string(data), 1);
+  frag->is_alive = true;
 }
 
 template <typename E>
 void compute_merged_section_sizes(Context<E> &ctx) {
   Timer t(ctx, "compute_merged_section_sizes");
 
-  // Mark section subsections referenced by live objects.
+  // Mark section fragments referenced by live objects.
   if (!ctx.arg.gc_sections) {
     tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-      for (Subsection<E> *subsec : file->subsections)
-        subsec->is_alive.store(true, std::memory_order_relaxed);
+      for (SectionFragment<E> *frag : file->fragments)
+        frag->is_alive.store(true, std::memory_order_relaxed);
     });
   }
 
@@ -261,6 +264,9 @@ static std::vector<std::span<T>> split(std::vector<T> &input, i64 unit) {
 template <typename E>
 void bin_sections(Context<E> &ctx) {
   Timer t(ctx, "bin_sections");
+
+  if (ctx.objs.empty())
+    return;
 
   static constexpr i64 num_shards = 128;
   i64 unit = (ctx.objs.size() + num_shards - 1) / num_shards;
@@ -306,12 +312,12 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
   obj->is_alive = true;
   obj->priority = 1;
 
-  auto add = [&](std::string_view name) {
+  auto add = [&](std::string_view name, u8 visibility = STV_HIDDEN) {
     ElfSym<E> esym = {};
     esym.st_type = STT_NOTYPE;
     esym.st_shndx = SHN_ABS;
     esym.st_bind = STB_GLOBAL;
-    esym.st_visibility = STV_HIDDEN;
+    esym.st_visibility = visibility;
     esyms->push_back(esym);
 
     Symbol<E> *sym = intern(ctx, name);
@@ -357,8 +363,11 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
     add(save_string(ctx, "__stop_" + std::string(chunk->name)));
   }
 
+  for (std::pair<std::string_view, std::string_view> defsym : ctx.arg.defsyms)
+    add(defsym.first, STV_DEFAULT);
+
   obj->elf_syms = *esyms;
-  obj->sym_subsections.resize(obj->elf_syms.size());
+  obj->sym_fragments.resize(obj->elf_syms.size());
 
   i64 num_globals = obj->elf_syms.size() - obj->first_global;
   obj->symvers.resize(num_globals);
@@ -537,13 +546,17 @@ void scan_rels(Context<E> &ctx) {
       ctx.got->add_got_symbol(ctx, sym);
 
     if (sym->flags & NEEDS_PLT) {
-      // If we need to create a canonical PLT (i.e. ctx.arg.pic is false),
-      // we can't use .plt.got because otherwise .plt.got and .plt would
-      // refer each other, resulting in an infinite loop at runtime.
-      if ((sym->flags & NEEDS_GOT) && !ctx.arg.pic)
-        ctx.pltgot->add_symbol(ctx, sym);
-      else
+      if (sym->flags & NEEDS_GOT) {
+        // If we need to create a canonical PLT, we can't use .plt.got
+        // because otherwise .plt.got and .got would refer each other,
+        // resulting in an infinite loop at runtime.
+        if (!ctx.arg.pic && sym->is_imported)
+          ctx.plt->add_symbol(ctx, sym);
+        else
+          ctx.pltgot->add_symbol(ctx, sym);
+      } else {
         ctx.plt->add_symbol(ctx, sym);
+      }
     }
 
     if (sym->flags & NEEDS_GOTTP)
@@ -584,26 +597,56 @@ template <typename E>
 void apply_version_script(Context<E> &ctx) {
   Timer t(ctx, "apply_version_script");
 
-  for (VersionPattern &elem : ctx.arg.version_patterns) {
-    assert(elem.pattern != "*");
+  auto to_regex = [](std::span<std::string_view> vec) -> std::string {
+    switch (vec.size()) {
+    case 0:
+      return "";
+    case 1:
+      return glob_to_regex(vec[0]);
+    default:
+      std::string re = glob_to_regex(vec[0]);
+      for (std::string_view s : vec.subspan(1))
+        re += "|" + glob_to_regex(s);
+      return re;
+    }
+  };
 
-    if (!elem.is_extern_cpp &&
-        elem.pattern.find('*') == elem.pattern.npos) {
-      Symbol<E> *sym = intern(ctx, elem.pattern);
-      if (sym->file && !sym->file->is_dso)
-        sym->ver_idx = elem.ver_idx;
-      continue;
+  for (VersionPattern &elem : ctx.arg.version_patterns) {
+    std::vector<std::string_view> vec;
+
+    for (std::string_view pat : elem.patterns) {
+      if (pat.find_first_of("*?") == pat.npos) {
+        Symbol<E> *sym = intern(ctx, pat);
+        if (sym->file && !sym->file->is_dso)
+          sym->ver_idx = elem.ver_idx;
+      } else {
+        vec.push_back(pat);
+      }
     }
 
-    std::regex re = glob_to_regex(elem.pattern);
+    if (vec.empty() && elem.cpp_patterns.empty())
+      continue;
+
+    auto flags = std::regex_constants::extended | std::regex_constants::optimize |
+                 std::regex_constants::nosubs;
+    std::regex re(to_regex(vec), flags);
+    std::regex cpp_re(to_regex(elem.cpp_patterns), flags);
 
     tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
       for (Symbol<E> *sym : file->get_global_syms()) {
-        if (sym->file == file) {
-          std::string_view name = sym->name();
-          if (elem.is_extern_cpp)
-            name = demangle(name);
-          if (std::regex_match(name.begin(), name.end(), re))
+        if (sym->file != file)
+          continue;
+
+        std::string_view name = sym->name();
+
+        if (!vec.empty() && std::regex_match(name.begin(), name.end(), re)) {
+          sym->ver_idx = elem.ver_idx;
+          continue;
+        }
+
+        if (!elem.cpp_patterns.empty()) {
+          std::string_view s = demangle(name);
+          if (std::regex_match(s.begin(), s.end(), cpp_re))
             sym->ver_idx = elem.ver_idx;
         }
       }
@@ -669,25 +712,20 @@ void compute_import_export(Context<E> &ctx) {
     });
   }
 
-  // Global symbols are exported from DSO by default.
-  if (ctx.arg.shared || ctx.arg.export_dynamic) {
-    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      for (Symbol<E> *sym : file->get_global_syms()) {
-        if (sym->file != file)
-          continue;
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (Symbol<E> *sym : file->get_global_syms()) {
+      if (sym->file != file || sym->visibility == STV_HIDDEN ||
+          sym->ver_idx == VER_NDX_LOCAL)
+        continue;
 
-        if (sym->visibility == STV_HIDDEN || sym->ver_idx == VER_NDX_LOCAL)
-          continue;
+      sym->is_exported = true;
 
-        sym->is_exported = true;
-
-        if (ctx.arg.shared && sym->visibility != STV_PROTECTED &&
-            !ctx.arg.Bsymbolic &&
-            !(ctx.arg.Bsymbolic_functions && sym->get_type() == STT_FUNC))
-          sym->is_imported = true;
-      }
-    });
-  }
+      if (ctx.arg.shared && sym->visibility != STV_PROTECTED &&
+          !ctx.arg.Bsymbolic &&
+          !(ctx.arg.Bsymbolic_functions && sym->get_type() == STT_FUNC))
+        sym->is_imported = true;
+    }
+  });
 }
 
 template <typename E>
@@ -695,15 +733,16 @@ void clear_padding(Context<E> &ctx) {
   Timer t(ctx, "clear_padding");
 
   auto zero = [&](Chunk<E> *chunk, i64 next_start) {
-    i64 pos = chunk->shdr.sh_offset;
-    if (chunk->shdr.sh_type != SHT_NOBITS)
-      pos += chunk->shdr.sh_size;
+    i64 pos = chunk->shdr.sh_offset + chunk->shdr.sh_size;
     memset(ctx.buf + pos, 0, next_start - pos);
   };
 
-  for (i64 i = 1; i < ctx.chunks.size(); i++)
-    zero(ctx.chunks[i - 1], ctx.chunks[i]->shdr.sh_offset);
-  zero(ctx.chunks.back(), ctx.output_file->filesize);
+  std::vector<Chunk<E> *> chunks = ctx.chunks;
+  erase(chunks, [](Chunk<E> *chunk) { return chunk->shdr.sh_type == SHT_NOBITS; });
+
+  for (i64 i = 1; i < chunks.size(); i++)
+    zero(chunks[i - 1], chunks[i]->shdr.sh_offset);
+  zero(chunks.back(), ctx.output_file->filesize);
 }
 
 // We want to sort output chunks in the following order.
@@ -722,23 +761,25 @@ void clear_padding(Context<E> &ctx) {
 //   alloc writable non-RELRO bss
 //   nonalloc
 //   section header
+//
+// .note sections are sorted by their alignments.
 template <typename E>
 i64 get_section_rank(Context<E> &ctx, Chunk<E> *chunk) {
   u64 type = chunk->shdr.sh_type;
   u64 flags = chunk->shdr.sh_flags;
 
   if (chunk == ctx.ehdr.get())
-    return -4;
+    return 0;
   if (chunk == ctx.phdr.get())
-    return -3;
+    return 1;
   if (chunk == ctx.interp.get())
-    return -2;
+    return 2;
   if (type == SHT_NOTE && (flags & SHF_ALLOC))
-    return -1;
+    return (1 << 10) + chunk->shdr.sh_addralign;
   if (chunk == ctx.shdr.get())
-    return 1 << 6;
+    return 1 << 30;
   if (!(flags & SHF_ALLOC))
-    return 1 << 5;
+    return (1 << 30) - 1;
 
   bool writable = (flags & SHF_WRITE);
   bool exec = (flags & SHF_EXECINSTR);
@@ -746,73 +787,79 @@ i64 get_section_rank(Context<E> &ctx, Chunk<E> *chunk) {
   bool relro = is_relro(ctx, chunk);
   bool is_bss = (type == SHT_NOBITS);
 
-  return (writable << 4) | (exec << 3) | (!tls << 2) |
-         (!relro << 1) | is_bss;
+  return (1 << 20) | (writable << 19) | (exec << 18) | (!tls << 17) |
+         (!relro << 16) | (is_bss << 15);
 }
 
 // Returns the smallest number n such that
-// n >= val and n % align == skew.
+// n >= val and n % align == skew % align.
 inline u64 align_with_skew(u64 val, u64 align, u64 skew) {
+  skew = skew % align;
   return align_to(val + align - skew, align) - align + skew;
+}
+
+template <typename E>
+static bool is_tbss(Chunk<E> *chunk) {
+  return (chunk->shdr.sh_type == SHT_NOBITS) && (chunk->shdr.sh_flags & SHF_TLS);
 }
 
 // Assign virtual addresses and file offsets to output sections.
 template <typename E>
 i64 set_osec_offsets(Context<E> &ctx) {
-  Timer t(ctx, "osec_offset");
+  Timer t(ctx, "set_osec_offsets");
 
-  u64 fileoff = 0;
-  u64 vaddr = ctx.arg.image_base;
+  std::vector<Chunk<E> *> &chunks = ctx.chunks;
 
-  i64 i = 0;
-  i64 end = 0;
-  while (ctx.chunks[end]->shdr.sh_flags & SHF_ALLOC)
-    end++;
+  // Assign virtual addresses
+  u64 addr = ctx.arg.image_base;
+  for (i64 i = 0; i < chunks.size(); i++) {
+    if (!(chunks[i]->shdr.sh_flags & SHF_ALLOC))
+      continue;
 
-  while (i < end) {
-    fileoff = align_with_skew(fileoff, COMMON_PAGE_SIZE, vaddr % COMMON_PAGE_SIZE);
+    if (i > 0 && separate_page(ctx, chunks[i - 1], chunks[i]))
+      addr = align_to(addr, ctx.page_size);
 
-    // Each group consists of zero or more non-BSS sections followed
-    // by zero or more BSS sections. Virtual addresses of non-BSS
-    // sections need to be congruent to file offsets modulo the page size.
-    // BSS sections don't increment file offsets.
-    for (; i < end && ctx.chunks[i]->shdr.sh_type != SHT_NOBITS; i++) {
-      Chunk<E> &chunk = *ctx.chunks[i];
-      u64 prev_vaddr = vaddr;
-
-      if (chunk.new_page)
-        vaddr = align_to(vaddr, COMMON_PAGE_SIZE);
-      vaddr = align_to(vaddr, chunk.shdr.sh_addralign);
-      fileoff += vaddr - prev_vaddr;
-
-      chunk.shdr.sh_addr = vaddr;
-      vaddr += chunk.shdr.sh_size;
-
-      chunk.shdr.sh_offset = fileoff;
-      fileoff += chunk.shdr.sh_size;
+    if (is_tbss(chunks[i])) {
+      chunks[i]->shdr.sh_addr = addr;
+      continue;
     }
 
-    for (; i < end && ctx.chunks[i]->shdr.sh_type == SHT_NOBITS; i++) {
-      Chunk<E> &chunk = *ctx.chunks[i];
+    addr = align_to(addr, chunks[i]->shdr.sh_addralign);
+    chunks[i]->shdr.sh_addr = addr;
+    addr += chunks[i]->shdr.sh_size;
+  }
 
-      if (chunk.new_page)
-        vaddr = align_to(vaddr, COMMON_PAGE_SIZE);
-      vaddr = align_to(vaddr, chunk.shdr.sh_addralign);
-      fileoff = align_with_skew(fileoff, COMMON_PAGE_SIZE, vaddr % COMMON_PAGE_SIZE);
-
-      chunk.shdr.sh_addr = vaddr;
-      chunk.shdr.sh_offset = fileoff;
-      if (!(chunk.shdr.sh_flags & SHF_TLS))
-        vaddr += chunk.shdr.sh_size;
+  // Fix tbss virtual addresses. tbss sections are laid out as if they
+  // were overlapping to suceeding non-tbss sections. This is fine
+  // because no one will actually access the TBSS part of a TLS
+  // template image at runtime.
+  //
+  // We can lay out tbss sections in the same way as regular bss
+  // sections, but that would need one more extra PT_LOAD segment.
+  // Having fewer PT_LOAD segments is generally desirable, so we do this.
+  for (i64 i = 0; i < chunks.size();) {
+    if (is_tbss(chunks[i])) {
+      u64 addr = chunks[i]->shdr.sh_addr;
+      for (; i < chunks.size() && is_tbss(chunks[i]); i++) {
+        addr = align_to(addr, chunks[i]->shdr.sh_addralign);
+        chunks[i]->shdr.sh_addr = addr;
+        addr += chunks[i]->shdr.sh_size;
+      }
+    } else {
+      i++;
     }
   }
 
-  for (; i < ctx.chunks.size(); i++) {
-    Chunk<E> &chunk = *ctx.chunks[i];
-    assert(!(chunk.shdr.sh_flags & SHF_ALLOC));
-    fileoff = align_to(fileoff, chunk.shdr.sh_addralign);
-    chunk.shdr.sh_offset = fileoff;
-    fileoff += chunk.shdr.sh_size;
+  // Assign file offsets
+  u64 fileoff = 0;
+  for (Chunk<E> *chunk : chunks) {
+    if (chunk->shdr.sh_type == SHT_NOBITS) {
+      chunk->shdr.sh_offset = fileoff;
+    } else {
+      fileoff = align_with_skew(fileoff, ctx.page_size, chunk->shdr.sh_addr);
+      chunk->shdr.sh_offset = fileoff;
+      fileoff += chunk->shdr.sh_size;
+    }
   }
   return fileoff;
 }
@@ -824,6 +871,20 @@ static i64 get_num_irelative_relocs(Context<E> &ctx) {
     if (sym->get_type() == STT_GNU_IFUNC)
       n++;
   return n;
+}
+
+static std::optional<u64> parse_defsym_addr(std::string_view s) {
+  if (s.starts_with("0x") || s.starts_with("0X")) {
+    size_t nread;
+    u64 addr = std::stoull(std::string(s), &nread, 16);
+    if (s.size() != nread)
+      return {};
+    return addr;
+  }
+
+  if (s.find_first_not_of("0123456789") == s.npos)
+    return std::stoull(std::string(s), nullptr, 10);
+  return {};
 }
 
 template <typename E>
@@ -932,6 +993,29 @@ void fix_synthetic_symbols(Context<E> &ctx) {
       stop(intern(ctx, sym2), chunk);
     }
   }
+
+  // --defsym=sym=value symbols
+  for (std::pair<std::string_view, std::string_view> defsym : ctx.arg.defsyms) {
+    Symbol<E> *sym = intern(ctx, defsym.first);
+    sym->input_section = nullptr;
+
+    if (std::optional<u64> addr = parse_defsym_addr(defsym.second)) {
+      sym->value = *addr;
+      continue;
+    }
+
+    Symbol<E> *sym2 = intern(ctx, defsym.second);
+    if (!sym2->file) {
+      Error(ctx) << "--defsym: undefined symbol: " << *sym2;
+      continue;
+    }
+
+    sym->value = sym2->get_addr(ctx);
+    sym->visibility = sym2->visibility.load();
+
+    if (InputSection<E> *isec = sym2->input_section)
+      sym->shndx = isec->output_section->shndx;
+  }
 }
 
 template <typename E>
@@ -987,6 +1071,6 @@ void compress_debug_sections(Context<E> &ctx) {
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
-INSTANTIATE(AARCH64);
+INSTANTIATE(ARM64);
 
 } // namespace mold::elf

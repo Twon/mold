@@ -22,7 +22,7 @@ typedef int64_t i64;
 
 struct X86_64;
 struct I386;
-struct AARCH64;
+struct ARM64;
 
 template <typename E> struct ElfSym;
 template <typename E> struct ElfShdr;
@@ -214,6 +214,7 @@ static constexpr u32 DF_1_INITFIRST = 0x00000020;
 static constexpr u32 DF_1_NOOPEN = 0x00000040;
 static constexpr u32 DF_1_ORIGIN = 0x00000080;
 static constexpr u32 DF_1_INTERPOSE = 0x00000400;
+static constexpr u32 DF_1_NODEFLIB = 0x00000800;
 static constexpr u32 DF_1_NODUMP = 0x00001000;
 static constexpr u32 DF_1_PIE = 0x08000000;
 
@@ -514,7 +515,7 @@ static constexpr u32 R_AARCH64_TLSDESC = 0x407;
 static constexpr u32 R_AARCH64_IRELATIVE = 0x408;
 
 template <>
-inline std::string rel_to_string<AARCH64>(u32 r_type) {
+inline std::string rel_to_string<ARM64>(u32 r_type) {
   switch (r_type) {
   case R_AARCH64_NONE: return "R_AARCH64_NONE";
   case R_AARCH64_ABS64: return "R_AARCH64_ABS64";
@@ -858,7 +859,7 @@ struct Elf64Nhdr {
 };
 
 struct X86_64 {
-  typedef u64 WordTy;
+  using WordTy = u64;
 
   static constexpr u32 R_NONE = R_X86_64_NONE;
   static constexpr u32 R_COPY = R_X86_64_COPY;
@@ -871,7 +872,8 @@ struct X86_64 {
   static constexpr u32 R_DTPMOD = R_X86_64_DTPMOD64;
   static constexpr u32 R_TLSDESC = R_X86_64_TLSDESC;
 
-  static constexpr u32 wordsize = 8;
+  static constexpr u32 word_size = 8;
+  static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_X86_64;
   static constexpr u32 plt_hdr_size = 16;
   static constexpr u32 plt_size = 16;
@@ -894,7 +896,7 @@ template <> struct ElfChdr<X86_64> : public Elf64Chdr {};
 template <> struct ElfNhdr<X86_64> : public Elf64Nhdr {};
 
 struct I386 {
-  typedef u32 WordTy;
+  using WordTy = u32;
 
   static constexpr u32 R_NONE = R_386_NONE;
   static constexpr u32 R_COPY = R_386_COPY;
@@ -907,7 +909,8 @@ struct I386 {
   static constexpr u32 R_DTPMOD = R_386_TLS_DTPMOD32;
   static constexpr u32 R_TLSDESC = R_386_TLS_DESC;
 
-  static constexpr u32 wordsize = 4;
+  static constexpr u32 word_size = 4;
+  static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_386;
   static constexpr u32 plt_hdr_size = 16;
   static constexpr u32 plt_size = 16;
@@ -929,8 +932,8 @@ template <> struct ElfVerdaux<I386> : public Elf64Verdaux {};
 template <> struct ElfChdr<I386> : public Elf32Chdr {};
 template <> struct ElfNhdr<I386> : public Elf64Nhdr {};
 
-struct AARCH64 {
-  typedef u64 WordTy;
+struct ARM64 {
+  using WordTy = u64;
 
   static constexpr u32 R_NONE = R_AARCH64_NONE;
   static constexpr u32 R_COPY = R_AARCH64_COPY;
@@ -943,7 +946,8 @@ struct AARCH64 {
   static constexpr u32 R_DTPMOD = R_AARCH64_TLS_DTPMOD64;
   static constexpr u32 R_TLSDESC = R_AARCH64_TLSDESC;
 
-  static constexpr u32 wordsize = 8;
+  static constexpr u32 word_size = 8;
+  static constexpr u32 page_size = 65536;
   static constexpr u32 e_machine = EM_AARCH64;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
@@ -952,17 +956,17 @@ struct AARCH64 {
   static constexpr bool is_le = true;
 };
 
-template <> struct ElfSym<AARCH64> : public Elf64Sym {};
-template <> struct ElfShdr<AARCH64> : public Elf64Shdr {};
-template <> struct ElfEhdr<AARCH64> : public Elf64Ehdr {};
-template <> struct ElfPhdr<AARCH64> : public Elf64Phdr {};
-template <> struct ElfRel<AARCH64> : public Elf64Rela {};
-template <> struct ElfDyn<AARCH64> : public Elf64Dyn {};
-template <> struct ElfVerneed<AARCH64> : public Elf64Verneed {};
-template <> struct ElfVernaux<AARCH64> : public Elf64Vernaux {};
-template <> struct ElfVerdef<AARCH64> : public Elf64Verdef {};
-template <> struct ElfVerdaux<AARCH64> : public Elf64Verdaux {};
-template <> struct ElfChdr<AARCH64> : public Elf64Chdr {};
-template <> struct ElfNhdr<AARCH64> : public Elf64Nhdr {};
+template <> struct ElfSym<ARM64> : public Elf64Sym {};
+template <> struct ElfShdr<ARM64> : public Elf64Shdr {};
+template <> struct ElfEhdr<ARM64> : public Elf64Ehdr {};
+template <> struct ElfPhdr<ARM64> : public Elf64Phdr {};
+template <> struct ElfRel<ARM64> : public Elf64Rela {};
+template <> struct ElfDyn<ARM64> : public Elf64Dyn {};
+template <> struct ElfVerneed<ARM64> : public Elf64Verneed {};
+template <> struct ElfVernaux<ARM64> : public Elf64Vernaux {};
+template <> struct ElfVerdef<ARM64> : public Elf64Verdef {};
+template <> struct ElfVerdaux<ARM64> : public Elf64Verdaux {};
+template <> struct ElfChdr<ARM64> : public Elf64Chdr {};
+template <> struct ElfNhdr<ARM64> : public Elf64Nhdr {};
 
 } // namespace mold::elf

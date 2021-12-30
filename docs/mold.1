@@ -396,6 +396,13 @@ Set \fIdir\fR to root directory.
 Compress DWARF debug info (\fB.debug_*\fR sections) using the zlib
 compression algorithm.
 
+.IP "\fB\-\-defsym\\fR=\fIsymbol\fR=\fIvalue\fR"
+
+Define \fIsymbol\fR as an alias for \fIvalue\fR. \fIvalue\fR is either
+an integer (in decimal or hexadecimal with 0x prefix) or a symbol name.
+If an integer is given as a value, \fIsymbol\fR is defined as an absolute
+symbol with the given value.
+
 .IP "\fB\-\-demangle\fR"
 .PD 0
 .IP "\fB\-\-no\-demangle\fR"
@@ -633,23 +640,55 @@ after it finishes its job.
 By default, \fBmold\fR generates a relro segment. \fB\-z
 norelro\fR disables the feature.
 
+.IP "\fB\-z separate\-loadable\-segments\fR"
+.PD 0
+.IP "\fB\-z separate\-code\fR"
+.PD 0
+.IP "\fB\-z noseparate\-code\fR"
+.PD
+If one memory page contains multiple segments, the page protection
+bits are set in such a way that needed attributes (writable or
+executable) are satisifed for all segments. This usually happens at a
+boundary of two segments with two different attributes.
+
+\fBseparate\-loadable\-segments\fR adds paddings between segments with
+different attributes so that they do not share the same page. This is
+the default.
+
+\fBseparate\-code\fR adds paddings only between executable and
+non-executable segments.
+
+\fBnoseparate\-code\fR does not add any paddings between segments.
+
 .IP "\fB\-z defs\fR"
 .PD 0
 .IP "\fB\-z nodefs\fR"
 .PD
-Report undefined symbols (even with \fI\-\-shared\fR)
-.IP "\fB\-z nocopyreloc\fR"
-Do not create copy relocations
+Report undefined symbols (even with \fI\-\-shared\fR).
+
+.IP "\fB\-z max\-page\-size\fR"
+Some CPU ISAs support multiple different memory page sizes.
+This option specifies the maximum page size that an output binary
+can run on. If you specify a large value, the output can run on
+both large and small page systems, but it wastes a bit of memory at
+page boundaries on systems with small pages.
+
+The default value is 4 KiB for i386 and x86-64, and 64 KiB for ARM64.
+
+.IP "\fB\-z nodefaultlib\fR"
+Make the dynamic loader to ignore default search paths.
 .IP "\fB\-z nodelete\fR"
-Mark DSO non-deletable at runtime
+Mark DSO non-deletable at runtime.
 .IP "\fB\-z nodlopen\fR"
-Mark DSO not available to dlopen
+Mark DSO not available to dlopen.
 .IP "\fB\-z nodump\fR"
-Mark DSO not available to dldump
+Mark DSO not available to dldump.
+.IP "\fB\-z nocopyreloc\fR"
+Do not create copy relocations.
 .IP "\fB\-z initfirst\fR"
-Mark DSO to be initialized first at runtime
+Mark DSO to be initialized first at runtime.
 .IP "\fB\-z interpose\fR"
-Mark object to interpose all DSOs but executable
+Mark object to interpose all DSOs but executable.
 
 .IP "\fB\-(\fR"
 .PD 0
@@ -679,6 +718,7 @@ Mark object to interpose all DSOs but executable
 .IP "\fB\-\-warn\-once\fR"
 .IP "\fB\-z combreloc\fR"
 .IP "\fB\-z nocombreloc\fR"
+.IP "\fB\-z common\-page\-size\fR"
 .PD
 Ignored
 

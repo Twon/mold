@@ -1,25 +1,29 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ..."
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
-mkdir -p $t
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t="$(pwd)/out/test/elf/$testname"
+mkdir -p "$t"
 
-cat <<EOF | g++ -c -o $t/a.o -g -gz=zlib-gnu -xc++ -
+which dwarfdump >& /dev/null || { echo skipped; exit; }
+
+cat <<EOF | g++ -c -o "$t"/a.o -g -gz=zlib-gnu -xc++ -
 int main() {
   return 0;
 }
 EOF
 
-cat <<EOF | g++ -c -o $t/b.o -g -gz=zlib -xc++ -
+cat <<EOF | g++ -c -o "$t"/b.o -g -gz=zlib -xc++ -
 int foo() {
   return 0;
 }
 EOF
 
-clang -fuse-ld=$mold -o $t/exe $t/a.o $t/b.o
-dwarfdump $t/exe > /dev/null
-readelf --sections $t/exe | fgrep -q .debug_info
+clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o "$t"/b.o
+dwarfdump "$t"/exe > /dev/null
+readelf --sections "$t"/exe | fgrep -q .debug_info
 
 echo ' OK'

@@ -55,9 +55,12 @@ Options:
                               Generate build ID
     --no-build-id
   --chroot DIR                Set a given path to root directory
-  --color-diagnostics         Ignored
+  --color-diagnostics=[auto,always,never]
+                              Use colors in diagnostics
+  --color-diagnostics         Alias for --color-diagnostics=always
   --compress-debug-sections [none,zlib,zlib-gabi,zlib-gnu]
                               Compress .debug_* sections
+  --defsym=SYMBOL=VALUE       Define a symbol alias
   --demangle                  Demangle C++ symbols in log messages (default)
     --no-demangle
   --disable-new-dtags         Ignored
@@ -108,10 +111,13 @@ Options:
   --sort-common               Ignored
   --sort-section              Ignored
   --spare-dynamic-tags NUMBER Reserve give number of tags in .dynamic section
+  --start-lib                 Give following object files in-archive-file semantics
+    --end-lib                 End the effect of --start-lib
   --static                    Do not link against shared libraries
   --stats                     Print input statistics
   --sysroot DIR               Set target system root directory
-  --thread-count COUNT        Use COUNT number of threads
+  --thread-count COUNT, --threads=COUNT
+                              Use COUNT number of threads
   --threads                   Use multiple threads (default)
     --no-threads
   --trace                     Print name of each input file
@@ -129,6 +135,7 @@ Options:
   --wrap SYMBOL               Use wrapper function for a given symbol
   -z defs                     Report undefined symbols (even with --shared)
     -z nodefs
+  -z common-page-size=VALUE   Ignored
   -z execstack                Require executable stack
     -z noexecstack
   -z initfirst                Mark DSO to be initialized first at runtime
@@ -136,12 +143,18 @@ Options:
   -z keep-text-section-prefix Keep .text.{hot,unknown,unlikely,startup,exit} as separate sections in the final binary
     -z nokeep-text-section-prefix
   -z lazy                     Enable lazy function resolution (default)
+  -z max-page-size=VALUE      Use VALUE as the memory page size
   -z nocopyreloc              Do not create copy relocations
+  -z nodefaultlib             Make the dynamic loader to ignore default search paths
   -z nodelete                 Mark DSO non-deletable at runtime
   -z nodlopen                 Mark DSO not available to dlopen
   -z nodump                   Mark DSO not available to dldump
   -z now                      Disable lazy function resolution
   -z origin                   Mark object requiring immediate $ORIGIN processing at runtime
+  -z separate-loadable-segments
+                              Separate all loadable segments to different pages
+    -z separate-code          Separate code and data into different pages
+    -z noseparate-code        Allow overlap in pages
   -z relro                    Make some sections read-only after relocation (default)
     -z norelro
   -z text                     Report error if DT_TEXTREL is set
@@ -225,11 +238,29 @@ static bool read_z_flag(std::span<std::string_view> &args, std::string name) {
 }
 
 template <typename E>
+bool read_z_arg(Context<E> &ctx, std::span<std::string_view> &args,
+                std::string_view &arg, std::string name) {
+  if (args.size() >= 2 && args[0] == "-z" && args[1].starts_with(name + "=")) {
+    arg = args[1].substr(name.size() + 1);
+    args = args.subspan(2);
+    return true;
+  }
+
+  if (!args.empty() && args[0].starts_with("-z" + name + "=")) {
+    arg = args[0].substr(name.size() + 3);
+    args = args.subspan(1);
+    return true;
+  }
+
+  return false;
+}
+
+template <typename E>
 std::string create_response_file(Context<E> &ctx) {
   std::string buf;
   std::stringstream out;
 
-  std::string cwd = get_current_dir();
+  std::string cwd = std::filesystem::current_path();
   out << "-C " << cwd.substr(1) << "\n";
 
   if (cwd != "/") {
@@ -367,6 +398,9 @@ void parse_nonpositional_args(Context<E> &ctx,
   std::span<std::string_view> args = ctx.cmdline_args;
   args = args.subspan(1);
 
+  ctx.arg.color_diagnostics = isatty(STDERR_FILENO);
+  ctx.page_size = E::page_size;
+
   bool version_shown = false;
 
   while (!args.empty()) {
@@ -405,6 +439,8 @@ void parse_nonpositional_args(Context<E> &ctx,
       } else {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
+    } else if (read_flag(args, "end-lib")) {
+      remaining.push_back("-end-lib");
     } else if (read_flag(args, "export-dynamic") || read_flag(args, "E")) {
       ctx.arg.export_dynamic = true;
     } else if (read_flag(args, "no-export-dynamic")) {
@@ -436,6 +472,13 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.shared = true;
     } else if (read_arg(ctx, args, arg, "spare-dynamic-tags")) {
       ctx.arg.spare_dynamic_tags = parse_number(ctx, "spare-dynamic-tags", arg);
+    } else if (read_flag(args, "start-lib")) {
+      remaining.push_back("-start-lib");
+    } else if (read_arg(ctx, args, arg, "defsym")) {
+      size_t pos = arg.find('=');
+      if (pos == arg.npos || pos == arg.size() - 1)
+        Fatal(ctx) << "-defsym: syntax error: " << arg;
+      ctx.arg.defsyms.push_back({arg.substr(0, pos), arg.substr(pos + 1)});
     } else if (read_flag(args, "demangle")) {
       ctx.arg.demangle = true;
     } else if (read_flag(args, "no-demangle")) {
@@ -451,7 +494,8 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_arg(ctx, args, arg, "sysroot")) {
       ctx.arg.sysroot = arg;
     } else if (read_arg(ctx, args, arg, "unique")) {
-      ctx.arg.unique.reset(new std::regex(glob_to_regex(arg)));
+      auto flags = std::regex_constants::extended | std::regex_constants::optimize;
+      ctx.arg.unique.reset(new std::regex(glob_to_regex(arg), flags));
     } else if (read_arg(ctx, args, arg, "unresolved-symbols")) {
       if (arg == "report-all" || arg == "ignore-in-shared-libs")
         ctx.arg.unresolved_symbols = UnresolvedKind::ERROR;
@@ -515,6 +559,20 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.directory = arg;
     } else if (read_arg(ctx, args, arg, "chroot")) {
       ctx.arg.chroot = arg;
+    } else if (args[0] == "-color-diagnostics=auto" ||
+               args[0] == "--color-diagnostics=auto") {
+      ctx.arg.color_diagnostics = isatty(STDERR_FILENO);
+      args = args.subspan(1);
+    } else if (args[0] == "-color-diagnostics=always" ||
+               args[0] == "--color-diagnostics=always") {
+      ctx.arg.color_diagnostics = true;
+      args = args.subspan(1);
+    } else if (args[0] == "-color-diagnostics=never" ||
+               args[0] == "--color-diagnostics=never") {
+      ctx.arg.color_diagnostics = false;
+      args = args.subspan(1);
+    } else if (read_flag(args, "color-diagnostics")) {
+      ctx.arg.color_diagnostics = true;
     } else if (read_flag(args, "warn-common")) {
       ctx.arg.warn_common = true;
     } else if (read_flag(args, "no-warn-common")) {
@@ -545,6 +603,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.z_now = false;
     } else if (read_z_flag(args, "execstack")) {
       ctx.arg.z_execstack = true;
+    } else if (read_z_arg(ctx, args, arg, "max-page-size")) {
+      ctx.page_size = parse_number(ctx, "-z max-page-size", arg);
+      if (__builtin_popcountll(ctx.page_size) != 1)
+        Fatal(ctx) << "-z max-page-size " << arg << ": value must be a power of 2";
     } else if (read_z_flag(args, "noexecstack")) {
       ctx.arg.z_execstack = false;
     } else if (read_z_flag(args, "relro")) {
@@ -579,6 +641,14 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.z_text = false;
     } else if (read_z_flag(args, "origin")) {
       ctx.arg.z_origin = true;
+    } else if (read_z_flag(args, "nodefaultlib")) {
+      ctx.arg.z_nodefaultlib = true;
+    } else if (read_z_flag(args, "separate-loadable-segments")) {
+      ctx.arg.z_separate_code = SEPARATE_LOADABLE_SEGMENTS;
+    } else if (read_z_flag(args, "separate-code")) {
+      ctx.arg.z_separate_code = SEPARATE_CODE;
+    } else if (read_z_flag(args, "noseparate-code")) {
+      ctx.arg.z_separate_code = NOSEPARATE_CODE;
     } else if (read_flag(args, "no-undefined")) {
       ctx.arg.z_defs = true;
     } else if (read_flag(args, "fatal-warnings")) {
@@ -626,6 +696,12 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.thread_count = 0;
     } else if (read_flag(args, "no-threads")) {
       ctx.arg.thread_count = 1;
+    } else if (args[0].starts_with("-threads=")) {
+      ctx.arg.thread_count = parse_number(ctx, "threads=", args[0].substr(9));
+      args = args.subspan(1);
+    } else if (args[0].starts_with("--threads=")) {
+      ctx.arg.thread_count = parse_number(ctx, "threads=", args[0].substr(10));
+      args = args.subspan(1);
     } else if (read_flag(args, "discard-all") || read_flag(args, "x")) {
       ctx.arg.discard_all = true;
     } else if (read_flag(args, "discard-locals") || read_flag(args, "X")) {
@@ -675,6 +751,14 @@ void parse_nonpositional_args(Context<E> &ctx,
       }
     } else if (read_flag(args, "no-build-id")) {
       ctx.arg.build_id.kind = BuildId::NONE;
+    } else if (read_arg(ctx, args, arg, "format") ||
+               read_arg(ctx, args, arg, "b")) {
+      if (arg == "binary")
+        Fatal(ctx)
+          << "mold does not suppor `-b binary`. If you want to convert a binary"
+          " file into an object file, use `objcopy -I binary -O elf64-x86-64"
+          << " <input-file> <output-file.o>` instead.";
+      Fatal(ctx) << "unknown command line option: -b " << arg;
     } else if (read_arg(ctx, args, arg, "auxiliary") ||
                read_arg(ctx, args, arg, "f")) {
       ctx.arg.auxiliary.push_back(arg);
@@ -685,6 +769,7 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.preload = true;
     } else if (read_flag(args, "no-preload")) {
       ctx.arg.preload = false;
+    } else if (read_flag(args, "apply-dynamic-relocs")) {
     } else if (read_arg(ctx, args, arg, "O")) {
     } else if (read_flag(args, "O0")) {
     } else if (read_flag(args, "O1")) {
@@ -706,6 +791,7 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_flag(args, "allow-shlib-undefined")) {
     } else if (read_flag(args, "no-allow-shlib-undefined")) {
     } else if (read_flag(args, "no-add-needed")) {
+    } else if (read_flag(args, "no-call-graph-profile-sort")) {
     } else if (read_flag(args, "no-copy-dt-needed-entries")) {
     } else if (read_flag(args, "no-undefined-version")) {
     } else if (read_arg(ctx, args, arg, "sort-section")) {
@@ -715,9 +801,12 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_flag(args, "warn-once")) {
     } else if (read_flag(args, "nodefaultlibs")) {
     } else if (read_flag(args, "warn-constructors")) {
+    } else if (read_flag(args, "warn-execstack")) {
+    } else if (read_flag(args, "no-warn-execstack")) {
     } else if (read_arg(ctx, args, arg, "rpath-link")) {
     } else if (read_z_flag(args, "combreloc")) {
     } else if (read_z_flag(args, "nocombreloc")) {
+    } else if (read_z_arg(ctx, args, arg, "common-page-size")) {
     } else if (read_arg(ctx, args, arg, "version-script")) {
       remaining.push_back("--version-script");
       remaining.push_back(arg);
@@ -742,11 +831,15 @@ void parse_nonpositional_args(Context<E> &ctx,
       remaining.push_back("-push-state");
     } else if (read_flag(args, "pop-state")) {
       remaining.push_back("-pop-state");
+    } else if (args[0].starts_with("-z") && args[0].size() > 2) {
+      Warn(ctx) << "unknown command line option: " << args[0];
+      args = args.subspan(1);
+    } else if (args[0] == "-z" && args.size() >= 2) {
+      Warn(ctx) << "unknown command line option: -z " << args[1];
+      args = args.subspan(2);
     } else {
-      if (args[0] == "-z" && args.size() >= 2)
-        Fatal(ctx) << "mold: unknown command line option: -z " << args[1];
       if (args[0][0] == '-')
-        Fatal(ctx) << "mold: unknown command line option: " << args[0];
+        Fatal(ctx) << "unknown command line option: " << args[0];
       remaining.push_back(args[0]);
       args = args.subspan(1);
     }
@@ -755,9 +848,9 @@ void parse_nonpositional_args(Context<E> &ctx,
   if (!ctx.arg.sysroot.empty()) {
     for (std::string &path : ctx.arg.library_paths) {
       if (std::string_view(path).starts_with('='))
-        path = std::string(ctx.arg.sysroot) + path.substr(1);
+        path = ctx.arg.sysroot + path.substr(1);
       else if (std::string_view(path).starts_with("$SYSROOT"))
-        path = std::string(ctx.arg.sysroot) + path.substr(8);
+        path = ctx.arg.sysroot + path.substr(8);
     }
   }
 
@@ -784,11 +877,21 @@ void parse_nonpositional_args(Context<E> &ctx,
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
 
+  if (ctx.arg.image_base % ctx.page_size)
+    Fatal(ctx) << "-image-base msut be a multiple of -max-page-size";
+
   if (char *env = getenv("MOLD_REPRO"); env && env[0])
     ctx.arg.repro = true;
 
   if (ctx.arg.output.empty())
     ctx.arg.output = "a.out";
+
+  if (ctx.arg.shared || ctx.arg.export_dynamic)
+    ctx.arg.default_version = VER_NDX_GLOBAL;
+  else
+    ctx.arg.default_version = VER_NDX_LOCAL;
+
+  ctx.arg.undefined.push_back(ctx.arg.entry);
 
   // TLSDESC relocs must be always relaxed for statically-linked
   // executables even if -no-relax is given. It is because a
@@ -814,6 +917,6 @@ void parse_nonpositional_args(Context<E> &ctx,
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
-INSTANTIATE(AARCH64);
+INSTANTIATE(ARM64);
 
 } // namespace mold::elf

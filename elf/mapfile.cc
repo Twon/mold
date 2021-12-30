@@ -93,7 +93,7 @@ void print_map(Context<E> &ctx) {
              << "          0     0                 "
              << *sym << "\n";
 
-      bufs[i] = std::move(ss.str());
+      bufs[i] = ss.str();
     });
 
     for (std::string &str : bufs)
@@ -106,6 +106,6 @@ void print_map(Context<E> &ctx) {
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
-INSTANTIATE(AARCH64);
+INSTANTIATE(ARM64);
 
 } // namespace mold::elf

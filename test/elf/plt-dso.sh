@@ -1,12 +1,14 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
-mkdir -p $t
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t="$(pwd)/out/test/elf/$testname"
+mkdir -p "$t"
 
-cat <<EOF | cc -fPIC -c -o $t/a.o -xc -
+cat <<EOF | cc -fPIC -c -o "$t"/a.o -xc -
 #include <stdio.h>
 
 void world() {
@@ -23,9 +25,9 @@ void hello() {
 }
 EOF
 
-clang -fuse-ld=$mold -shared -o $t/b.so $t/a.o
+clang -fuse-ld="$mold" -shared -o "$t"/b.so "$t"/a.o
 
-cat <<EOF | cc -c -o $t/c.o -xc -
+cat <<EOF | cc -c -o "$t"/c.o -xc -
 #include <stdio.h>
 
 void world() {
@@ -39,7 +41,7 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold -o $t/exe -Wl,-rpath=$t $t/c.o $t/b.so
-$t/exe | grep -q 'Hello WORLD'
+clang -fuse-ld="$mold" -o "$t"/exe -Wl,-rpath="$t" "$t"/c.o "$t"/b.so
+"$t"/exe | grep -q 'Hello WORLD'
 
 echo OK

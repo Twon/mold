@@ -1,12 +1,14 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
-mkdir -p $t
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t="$(pwd)/out/test/elf/$testname"
+mkdir -p "$t"
 
-cat <<EOF | cc -c -o $t/a.o -ffunction-sections -fdata-sections -xc -
+cat <<EOF | cc -c -o "$t"/a.o -ffunction-sections -fdata-sections -xc -
 #include <stdio.h>
 
 int bar() {
@@ -32,7 +34,7 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold -o $t/exe $t/a.o -Wl,-icf=all
-$t/exe | grep -q '1 0'
+clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o -Wl,-icf=all
+"$t"/exe | grep -q '1 0'
 
 echo OK

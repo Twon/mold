@@ -150,7 +150,7 @@ template <>
 void InputSection<X86_64>::apply_reloc_alloc(Context<X86_64> &ctx, u8 *base) {
   ElfRel<X86_64> *dynrel = nullptr;
   std::span<ElfRel<X86_64>> rels = get_rels(ctx);
-  i64 subsec_idx = 0;
+  i64 frag_idx = 0;
 
   if (ctx.reldyn)
     dynrel = (ElfRel<X86_64> *)(ctx.buf + ctx.reldyn->shdr.sh_offset +
@@ -164,9 +164,9 @@ void InputSection<X86_64>::apply_reloc_alloc(Context<X86_64> &ctx, u8 *base) {
     Symbol<X86_64> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    const SubsectionRef<X86_64> *ref = nullptr;
-    if (rel_subsections && rel_subsections[subsec_idx].idx == i)
-      ref = &rel_subsections[subsec_idx++];
+    const SectionFragmentRef<X86_64> *ref = nullptr;
+    if (rel_fragments && rel_fragments[frag_idx].idx == i)
+      ref = &rel_fragments[frag_idx++];
 
     auto overflow_check = [&](i64 val, i64 lo, i64 hi) {
       if (val < lo || hi <= val)
@@ -205,7 +205,7 @@ void InputSection<X86_64>::apply_reloc_alloc(Context<X86_64> &ctx, u8 *base) {
       *(u32 *)loc = val;
     };
 
-#define S   (ref ? ref->subsec->get_addr(ctx) : sym.get_addr(ctx))
+#define S   (ref ? ref->frag->get_addr(ctx) : sym.get_addr(ctx))
 #define A   (ref ? ref->addend : rel.r_addend)
 #define P   (output_section->shdr.sh_addr + offset + rel.r_offset)
 #define G   (sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr)
@@ -403,7 +403,7 @@ void InputSection<X86_64>::apply_reloc_alloc(Context<X86_64> &ctx, u8 *base) {
 template <>
 void InputSection<X86_64>::apply_reloc_nonalloc(Context<X86_64> &ctx, u8 *base) {
   std::span<ElfRel<X86_64>> rels = get_rels(ctx);
-  i64 subsec_idx = 0;
+  i64 frag_idx = 0;
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<X86_64> &rel = rels[i];
@@ -418,9 +418,9 @@ void InputSection<X86_64>::apply_reloc_nonalloc(Context<X86_64> &ctx, u8 *base) 
       continue;
     }
 
-    const SubsectionRef<X86_64> *ref = nullptr;
-    if (rel_subsections && rel_subsections[subsec_idx].idx == i)
-      ref = &rel_subsections[subsec_idx++];
+    const SectionFragmentRef<X86_64> *ref = nullptr;
+    if (rel_fragments && rel_fragments[frag_idx].idx == i)
+      ref = &rel_fragments[frag_idx++];
 
     auto overflow_check = [&](i64 val, i64 lo, i64 hi) {
       if (val < lo || hi <= val)
@@ -434,18 +434,8 @@ void InputSection<X86_64>::apply_reloc_nonalloc(Context<X86_64> &ctx, u8 *base) 
       *loc = val;
     };
 
-    auto write8s = [&](u64 val) {
-      overflow_check(val, -(1 << 7), 1 << 7);
-      *loc = val;
-    };
-
     auto write16 = [&](u64 val) {
       overflow_check(val, 0, 1 << 16);
-      *(u16 *)loc = val;
-    };
-
-    auto write16s = [&](u64 val) {
-      overflow_check(val, -(1 << 15), 1 << 15);
       *(u16 *)loc = val;
     };
 
@@ -459,7 +449,7 @@ void InputSection<X86_64>::apply_reloc_nonalloc(Context<X86_64> &ctx, u8 *base) 
       *(u32 *)loc = val;
     };
 
-#define S   (ref ? ref->subsec->get_addr(ctx) : sym.get_addr(ctx))
+#define S   (ref ? ref->frag->get_addr(ctx) : sym.get_addr(ctx))
 #define A   (ref ? ref->addend : rel.r_addend)
 
     switch (rel.r_type) {
@@ -512,7 +502,6 @@ void InputSection<X86_64>::scan_relocations(Context<X86_64> &ctx) {
 
   this->reldyn_offset = file.num_dynrel * sizeof(ElfRel<X86_64>);
   std::span<ElfRel<X86_64>> rels = get_rels(ctx);
-  bool is_writable = (shdr.sh_flags & SHF_WRITE);
 
   // Scan relocations
   for (i64 i = 0; i < rels.size(); i++) {
@@ -629,19 +618,12 @@ void InputSection<X86_64>::scan_relocations(Context<X86_64> &ctx) {
     case R_X86_64_TLSLD:
       if (i + 1 == rels.size())
         Fatal(ctx) << *this
-                   << ": TLSGD reloc must be followed by PLT32 or GOTPCREL";
-      if (sym.is_imported)
-        Fatal(ctx) << *this << ": TLSLD reloc refers external symbol " << sym;
+                   << ": TLSLD reloc must be followed by PLT32 or GOTPCREL";
 
       if (ctx.arg.relax && !ctx.arg.shared)
         i++;
       else
         sym.flags |= NEEDS_TLSLD;
-      break;
-    case R_X86_64_DTPOFF32:
-    case R_X86_64_DTPOFF64:
-      if (sym.is_imported)
-        Fatal(ctx) << *this << ": DTPOFF reloc refers external symbol " << sym;
       break;
     case R_X86_64_GOTTPOFF: {
       ctx.has_gottp_rel = true;
@@ -662,6 +644,8 @@ void InputSection<X86_64>::scan_relocations(Context<X86_64> &ctx) {
         sym.flags |= NEEDS_TLSDESC;
       break;
     }
+    case R_X86_64_DTPOFF32:
+    case R_X86_64_DTPOFF64:
     case R_X86_64_TPOFF32:
     case R_X86_64_TPOFF64:
     case R_X86_64_SIZE32:

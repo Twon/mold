@@ -1,12 +1,14 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
-mkdir -p $t
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t="$(pwd)/out/test/elf/$testname"
+mkdir -p "$t"
 
-cat <<'EOF' | cc -c -o $t/a.o -x assembler -
+cat <<'EOF' | cc -c -o "$t"/a.o -x assembler -
 .globl val1, val2, val3
 
 .section .rodata.str1.1,"aMS",@progbits,1
@@ -24,7 +26,7 @@ val3:
 .ascii "abcdefgh"
 EOF
 
-cat <<'EOF' | cc -c -o $t/b.o -xc -
+cat <<'EOF' | cc -c -o "$t"/b.o -xc -
 #include <stdio.h>
 
 extern char val1, val2, val3;
@@ -34,10 +36,10 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold -o $t/exe $t/a.o $t/b.o
+clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o "$t"/b.o
 
-readelf -p .rodata.str $t/exe | grep -q Hello
-readelf -p .rodata.str $t/exe | grep -q world
-readelf -p .rodata.cst $t/exe | grep -q abcdefgh
+readelf -p .rodata.str "$t"/exe | grep -q Hello
+readelf -p .rodata.str "$t"/exe | grep -q world
+readelf -p .rodata.cst "$t"/exe | grep -q abcdefgh
 
 echo OK

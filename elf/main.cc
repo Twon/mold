@@ -16,15 +16,27 @@
 
 namespace mold::elf {
 
-std::regex glob_to_regex(std::string_view pattern) {
+std::string glob_to_regex(std::string_view pattern) {
   std::stringstream ss;
-  for (u8 c : pattern) {
-    if (c == '*')
+  for (char c : pattern) {
+    switch (c) {
+    case '.': case '[': case ']': case '^':
+    case '$': case '\\': case '(': case ')':
+    case '+': case '|':
+      ss << "\\" << c;
+      break;
+    case '*':
       ss << ".*";
-    else
-      ss << "\\x" << std::hex << std::setw(2) << std::setfill('0') << (int)c;
+      break;
+    case '?':
+      ss << ".";
+      break;
+    default:
+      ss << c;
+      break;
+    }
   }
-  return std::regex(ss.str(), std::regex::optimize);
+  return ss.str();
 }
 
 template <typename E>
@@ -33,7 +45,7 @@ static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile<Context<E>> *m
   static Counter count("parsed_objs");
   count++;
 
-  bool in_lib = (!archive_name.empty() && !ctx.whole_archive);
+  bool in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
   ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, archive_name, in_lib);
   file->priority = ctx.file_priority++;
   ctx.tg.run([file, &ctx]() { file->parse(ctx); });
@@ -147,7 +159,7 @@ template <typename E>
 static void read_input_files(Context<E> &ctx, std::span<std::string_view> args) {
   Timer t(ctx, "read_input_files");
 
-  std::vector<std::tuple<bool, bool, bool>> state;
+  std::vector<std::tuple<bool, bool, bool, bool>> state;
   ctx.is_static = ctx.arg.is_static;
 
   while (!args.empty()) {
@@ -165,16 +177,22 @@ static void read_input_files(Context<E> &ctx, std::span<std::string_view> args) 
       ctx.is_static = true;
     } else if (read_flag(args, "Bdynamic")) {
       ctx.is_static = false;
+    } else if (read_flag(args, "start-lib")) {
+      ctx.in_lib = true;
+    } else if (read_flag(args, "end-lib")) {
+      ctx.in_lib = false;
     } else if (read_arg(ctx, args, arg, "version-script")) {
       parse_version_script(ctx, std::string(arg));
     } else if (read_arg(ctx, args, arg, "dynamic-list")) {
       parse_dynamic_list(ctx, std::string(arg));
     } else if (read_flag(args, "push-state")) {
-      state.push_back({ctx.as_needed, ctx.whole_archive, ctx.is_static});
+      state.push_back({ctx.as_needed, ctx.whole_archive, ctx.is_static,
+                       ctx.in_lib});
     } else if (read_flag(args, "pop-state")) {
       if (state.empty())
         Fatal(ctx) << "no state pushed before popping";
-      std::tie(ctx.as_needed, ctx.whole_archive, ctx.is_static) = state.back();
+      std::tie(ctx.as_needed, ctx.whole_archive, ctx.is_static, ctx.in_lib) =
+        state.back();
       state.pop_back();
     } else if (read_arg(ctx, args, arg, "l")) {
       MappedFile<Context<E>> *mf = find_library(ctx, std::string(arg));
@@ -228,9 +246,6 @@ static bool reload_input_files(Context<E> &ctx) {
 
   // Reload updated .so files
   for (SharedFile<E> *file : ctx.dsos) {
-    MappedFile<Context<E>> *mf =
-      MappedFile<Context<E>>::must_open(ctx, file->mf->name);
-
     if (get_mtime(ctx, file->mf->name) == file->mf->mtime) {
       dsos.push_back(file);
     } else {
@@ -329,7 +344,7 @@ static int elf_main(int argc, char **argv) {
     case EM_386:
       return elf_main<I386>(argc, argv);
     case EM_AARCH64:
-      return elf_main<AARCH64>(argc, argv);
+      return elf_main<ARM64>(argc, argv);
     }
     unreachable();
   }
@@ -352,9 +367,10 @@ static int elf_main(int argc, char **argv) {
 
   install_signal_handler();
 
-  if (!ctx.arg.directory.empty() && chdir(ctx.arg.directory.c_str()) == -1)
-    Fatal(ctx) << "chdir failed: " << ctx.arg.directory
-               << ": " << errno_string();
+  if (!ctx.arg.directory.empty())
+    if (chdir(ctx.arg.directory.c_str()) == -1)
+      Fatal(ctx) << "chdir failed: " << ctx.arg.directory
+                 << ": " << errno_string();
 
   // Handle --wrap options if any.
   for (std::string_view name : ctx.arg.wrap)
@@ -385,14 +401,15 @@ static int elf_main(int argc, char **argv) {
     if (!reload_input_files(ctx)) {
       std::vector<char *> args(argv, argv + argc);
       args.push_back((char *)"--no-preload");
+      args.push_back(nullptr);
       return elf_main<E>(argc + 1, args.data());
     }
   }
 
   {
-    Timer t(ctx, "register_subsections");
+    Timer t(ctx, "register_section_pieces");
     tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      file->register_subsections(ctx);
+      file->register_section_pieces(ctx);
     });
   }
 
@@ -444,7 +461,7 @@ static int elf_main(int argc, char **argv) {
   // Compute sizes of sections containing mergeable strings.
   compute_merged_section_sizes(ctx);
 
-  // Put input sections into output sections
+  // Bin input sections into output sections.
   bin_sections(ctx);
 
   // Get a list of output sections.
@@ -462,6 +479,10 @@ static int elf_main(int argc, char **argv) {
   // If we are linking a .so file, remaining undefined symbols does
   // not cause a linker error. Instead, they are treated as if they
   // were imported symbols.
+  //
+  // If we are linking an executable, weak undefs are converted to
+  // weakly imported symbol so that they'll have another chance to be
+  // resolved.
   claim_unresolved_symbols(ctx);
 
   // Beyond this point, no new symbols will be added to the result.
@@ -537,9 +558,7 @@ static int elf_main(int argc, char **argv) {
     ctx.eh_frame->construct(ctx);
   }
 
-  // Now that we have computed sizes for all sections and assigned
-  // section indices to them, so we can fix section header contents
-  // for all output sections.
+  // Update shdr.sh_size for each chunk and remove empty ones.
   for (Chunk<E> *chunk : ctx.chunks)
     chunk->update_shdr(ctx);
 
@@ -553,6 +572,8 @@ static int elf_main(int argc, char **argv) {
     if (ctx.chunks[i]->kind != Chunk<E>::HEADER)
       ctx.chunks[i]->shndx = shndx++;
 
+  // Some types of section header refer other section by index.
+  // Recompute the section header to fill such fields with correct values.
   for (Chunk<E> *chunk : ctx.chunks)
     chunk->update_shdr(ctx);
 
@@ -570,12 +591,11 @@ static int elf_main(int argc, char **argv) {
   }
 
   // At this point, file layout is fixed.
-
   // Beyond this, you can assume that symbol addresses including their
   // GOT or PLT addresses have a correct final value.
 
-  // Some types of relocations for TLS symbols need the TLS segment
-  // address. Find it out now.
+  // Some types of TLS relocations are defined relative to the beginning
+  // or the end of the TLS segment address. Find these addresses now.
   for (ElfPhdr<E> phdr : create_phdr(ctx)) {
     if (phdr.p_type == PT_TLS) {
       ctx.tls_begin = phdr.p_vaddr;
@@ -622,7 +642,7 @@ static int elf_main(int argc, char **argv) {
 
   t_copy.stop();
 
-  // Commit
+  // Close the output file. This is the end of the linker's main job.
   ctx.output_file->close(ctx);
 
   t_total.stop();
@@ -660,6 +680,6 @@ int main(int argc, char **argv) {
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
-INSTANTIATE(AARCH64);
+INSTANTIATE(ARM64);
 
 } // namespace mold::elf

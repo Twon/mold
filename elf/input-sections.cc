@@ -28,8 +28,8 @@ template <typename E>
 InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
                               const ElfShdr<E> &shdr, std::string_view name,
                               std::string_view contents, i64 section_idx)
-  : file(file), shdr(shdr), nameptr(name.data()), namelen(name.size()),
-    contents(contents), section_idx(section_idx) {
+  : file(file), shdr(shdr), contents(contents), nameptr(name.data()),
+    namelen(name.size()), section_idx(section_idx) {
   // As a special case, we want to map .ctors and .dtors to
   // .init_array and .fini_array, respectively. However, old CRT
   // object files are not compatible with this translation, so we need
@@ -41,14 +41,15 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
   // former, but as it is often the case, the former still lingers
   // around, so we need to keep this code to conver the old mechanism
   // to the new one.
-  std::string_view stem = path_filename(file.filename);
-  if (stem != "crtbegin.o" && stem != "crtend.o" &&
-      stem != "crtbeginS.o" && stem != "crtendS.o" &&
-      stem != "crtbeginT.o" && stem != "crtendT.o") {;
-    if (name == ".ctors" || name.starts_with(".ctors."))
+  std::string s = filepath(file.filename).filename();
+  if (s != "crtbegin.o" && s != "crtend.o" &&
+      s != "crtbeginS.o" && s != "crtendS.o" &&
+      s != "crtbeginT.o" && s != "crtendT.o") {;
+    if (name == ".ctors" || name.starts_with(".ctors.")) {
       name = ".init_array";
-    else if (name == ".dtors" || name.starts_with(".dtors."))
+    } else if (name == ".dtors" || name.starts_with(".dtors.")) {
       name = ".fini_array";
+    }
   }
 
   output_section =
@@ -179,11 +180,11 @@ void InputSection<E>::report_undef(Context<E> &ctx, Symbol<E> &sym) {
 }
 
 #define INSTANTIATE(E)                          \
-  template class CieRecord<E>;                  \
+  template struct CieRecord<E>;                 \
   template class InputSection<E>;
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
-INSTANTIATE(AARCH64);
+INSTANTIATE(ARM64);
 
 } // namespace mold::elf

@@ -18,7 +18,7 @@ class MemoryMappedOutputFile : public OutputFile<E> {
 public:
   MemoryMappedOutputFile(Context<E> &ctx, std::string path, i64 filesize, i64 perm)
     : OutputFile<E>(path, filesize, true) {
-    std::string dir(path_dirname(path));
+    std::string dir = filepath(path).parent_path();
     output_tmpfile = (char *)save_string(ctx, dir + "/.mold-XXXXXX").data();
     i64 fd = mkstemp(output_tmpfile);
     if (fd == -1)
@@ -128,6 +128,6 @@ OutputFile<E>::open(Context<E> &ctx, std::string path, i64 filesize, i64 perm) {
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
-INSTANTIATE(AARCH64);
+INSTANTIATE(ARM64);
 
 } // namespace mold::elf

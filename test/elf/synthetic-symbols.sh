@@ -1,19 +1,21 @@
 #!/bin/bash
+export LANG=
 set -e
-cd $(dirname $0)
-mold=`pwd`/../../mold
-echo -n "Testing $(basename -s .sh $0) ... "
-t=$(pwd)/../../out/test/elf/$(basename -s .sh $0)
-mkdir -p $t
+testname=$(basename -s .sh "$0")
+echo -n "Testing $testname ... "
+cd "$(dirname "$0")"/../..
+mold="$(pwd)/mold"
+t="$(pwd)/out/test/elf/$testname"
+mkdir -p "$t"
 
-cat <<EOF | clang -c -o $t/a.o -x assembler -
+cat <<EOF | clang -c -o "$t"/a.o -x assembler -
 .section foo,"a",@progbits
 .ascii "section foo"
 EOF
 
 # Test synthetic symbols
 
-cat <<EOF | clang -c -o $t/b.o -xc -
+cat <<EOF | clang -c -o "$t"/b.o -xc -
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -43,17 +45,17 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold -no-pie -Wl,--image-base=0x40000 \
-  -o $t/exe $t/a.o $t/b.o
-$t/exe > $t/log
+clang -fuse-ld="$mold" -no-pie -Wl,--image-base=0x40000 \
+  -o "$t"/exe "$t"/a.o "$t"/b.o
+"$t"/exe > "$t"/log
 
-grep -q '^__ehdr_start=0x40000$' $t/log
-grep -q '^__executable_start=0x40000$' $t/log
-grep -q '^section foo$' $t/log
+grep -q '^__ehdr_start=0x40000$' "$t"/log
+grep -q '^__executable_start=0x40000$' "$t"/log
+grep -q '^section foo$' "$t"/log
 
 # Make sure that synthetic symbols overwrite existing ones
 
-cat <<EOF | clang -c -o $t/c.o -xc -
+cat <<EOF | clang -c -o "$t"/c.o -xc -
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -87,15 +89,15 @@ int main() {
 }
 EOF
 
-clang -fuse-ld=$mold -no-pie -Wl,--image-base=0x40000 \
-  -o $t/exe $t/a.o $t/c.o
-$t/exe > $t/log
+clang -fuse-ld="$mold" -no-pie -Wl,--image-base=0x40000 \
+  -o "$t"/exe "$t"/a.o "$t"/c.o
+"$t"/exe > "$t"/log
 
-grep -q '^end=foo$' $t/log
-grep -q '^etext=foo$' $t/log
-grep -q '^edata=foo$' $t/log
-grep -q '^__ehdr_start=0x40000$' $t/log
-grep -q '^__executable_start=0x40000$' $t/log
-grep -q '^section foo$' $t/log
+grep -q '^end=foo$' "$t"/log
+grep -q '^etext=foo$' "$t"/log
+grep -q '^edata=foo$' "$t"/log
+grep -q '^__ehdr_start=0x40000$' "$t"/log
+grep -q '^__executable_start=0x40000$' "$t"/log
+grep -q '^section foo$' "$t"/log
 
 echo OK
