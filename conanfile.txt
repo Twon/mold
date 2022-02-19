@@ -3,6 +3,7 @@ onetbb/2021.3.0
 xxhash/0.8.0
 openssl/3.0.0
 zlib/1.2.11
+mimalloc/2.0.3
 
 [generators]
 cmake_find_package
