@@ -27,7 +27,7 @@ static void create_internal_file(Context<E> &ctx) {
   ctx.objs.push_back(obj);
 
   auto add = [&](std::string_view name) {
-    Symbol<E> *sym = intern(ctx, name);
+    Symbol<E> *sym = get_symbol(ctx, name);
     sym->file = obj;
     obj->syms.push_back(sym);
     return sym;
@@ -171,7 +171,7 @@ static void scan_unwind_info(Context<E> &ctx) {
 
 template <typename E>
 static void export_symbols(Context<E> &ctx) {
-  ctx.got.add(ctx, intern(ctx, "dyld_stub_binder"));
+  ctx.got.add(ctx, get_symbol(ctx, "dyld_stub_binder"));
 
   for (ObjectFile<E> *file : ctx.objs) {
     for (Symbol<E> *sym : file->syms) {
@@ -219,9 +219,9 @@ static i64 assign_offsets(Context<E> &ctx) {
 
 template <typename E>
 static void fix_synthetic_symbol_values(Context<E> &ctx) {
-  intern(ctx, "__dyld_private")->value = ctx.data->hdr.addr;
-  intern(ctx, "__mh_dylib_header")->value = ctx.data->hdr.addr;
-  intern(ctx, "__mh_bundle_header")->value = ctx.data->hdr.addr;
+  get_symbol(ctx, "__dyld_private")->value = ctx.data->hdr.addr;
+  get_symbol(ctx, "__mh_dylib_header")->value = ctx.data->hdr.addr;
+  get_symbol(ctx, "__mh_bundle_header")->value = ctx.data->hdr.addr;
 }
 
 template <typename E>
@@ -350,6 +350,9 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
       args = args.subspan(1);
     }
   }
+
+  if (ctx.objs.empty())
+    Fatal(ctx) << "no input files";
 }
 
 template <typename E>
@@ -369,8 +372,10 @@ static int do_main(int argc, char **argv) {
   std::vector<std::string> file_args;
   parse_nonpositional_args(ctx, file_args);
 
-  if (ctx.arg.arch == CPU_TYPE_X86_64)
-    return do_main<X86_64>(argc, argv);
+  if (ctx.arg.arch != E::cputype) {
+    if (ctx.arg.arch == CPU_TYPE_X86_64)
+      return do_main<X86_64>(argc, argv);
+  }
 
   read_input_files(ctx, file_args);
 
@@ -411,13 +416,13 @@ static int do_main(int argc, char **argv) {
   for (DylibFile<E> *dylib : ctx.dylibs)
     dylib->resolve_symbols(ctx);
 
-  if (ctx.output_type == MH_EXECUTE && !intern(ctx, ctx.arg.entry)->file)
+  if (ctx.output_type == MH_EXECUTE && !get_symbol(ctx, ctx.arg.entry)->file)
     Error(ctx) << "undefined entry point symbol: " << ctx.arg.entry;
 
   create_internal_file(ctx);
 
-  erase(ctx.objs, [](ObjectFile<E> *file) { return !file->is_alive; });
-  erase(ctx.dylibs, [](DylibFile<E> *file) { return !file->is_alive; });
+  std::erase_if(ctx.objs, [](ObjectFile<E> *file) { return !file->is_alive; });
+  std::erase_if(ctx.dylibs, [](DylibFile<E> *file) { return !file->is_alive; });
 
   if (ctx.arg.trace) {
     for (ObjectFile<E> *file : ctx.objs)
@@ -447,7 +452,7 @@ static int do_main(int argc, char **argv) {
   scan_unwind_info(ctx);
 
   if (ctx.arg.dead_strip_dylibs)
-    erase(ctx.dylibs, [](DylibFile<E> *file) { return !file->is_needed; });
+    std::erase_if(ctx.dylibs, [](DylibFile<E> *file) { return !file->is_needed; });
 
   export_symbols(ctx);
   i64 output_size = assign_offsets(ctx);

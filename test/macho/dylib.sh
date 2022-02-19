@@ -1,14 +1,16 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/ld64.mold"
-t="$(pwd)/out/test/macho/$testname"
-mkdir -p "$t"
+t=out/test/macho/$testname
+mkdir -p $t
 
-cat <<EOF | cc -c -o "$t"/a.o -xc -
+cat <<EOF | $CC -c -o $t/a.o -xc -
 #include <stdio.h>
 char world[] = "world";
 
@@ -17,9 +19,9 @@ char *hello() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o "$t"/b.dylib -shared "$t"/a.o
+clang -fuse-ld="$mold" -o $t/b.dylib -shared $t/a.o
 
-cat <<EOF | cc -o "$t"/c.o -c -xc -
+cat <<EOF | $CC -o $t/c.o -c -xc -
 #include <stdio.h>
 
 char *hello();
@@ -30,7 +32,7 @@ int main() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/c.o "$t"/b.dylib
-"$t"/exe | grep -q 'Hello world'
+clang -fuse-ld="$mold" -o $t/exe $t/c.o $t/b.dylib
+$t/exe | grep -q 'Hello world'
 
 echo OK

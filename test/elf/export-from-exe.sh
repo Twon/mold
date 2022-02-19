@@ -1,30 +1,38 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
-cat <<EOF | cc -o "$t"/a.o -c -xc -
+cat <<EOF | $CC -o $t/a.o -c -xc -
 void expfn1() {}
 void expfn2() {}
-int main() {}
+void foo();
+
+int main() {
+  expfn1();
+  expfn2();
+  foo();
+}
 EOF
 
-cat <<EOF | cc -shared -o "$t"/b.so -xc -
+cat <<EOF | $CC -shared -o $t/b.so -xc -
 void expfn1();
 void expfn2() {}
 
-int foo() {
+void foo() {
   expfn1();
 }
 EOF
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o "$t"/b.so
-readelf --dyn-syms "$t"/exe | grep -q expfn2
-readelf --dyn-syms "$t"/exe | grep -q expfn1
+$CC -B. -o $t/exe $t/a.o $t/b.so
+readelf --dyn-syms $t/exe | grep -q expfn2
+readelf --dyn-syms $t/exe | grep -q expfn1
 
 echo OK

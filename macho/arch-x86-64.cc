@@ -35,9 +35,9 @@ void StubHelperSection<X86_64>::copy_buf(Context<X86_64> &ctx) {
 
   memcpy(buf, insn0, sizeof(insn0));
   *(u32 *)(buf + 3) =
-    intern(ctx, "__dyld_private")->get_addr(ctx) - this->hdr.addr - 7;
+    get_symbol(ctx, "__dyld_private")->get_addr(ctx) - this->hdr.addr - 7;
   *(u32 *)(buf + 11) =
-    intern(ctx, "dyld_stub_binder")->get_got_addr(ctx) - this->hdr.addr - 15;
+    get_symbol(ctx, "dyld_stub_binder")->get_got_addr(ctx) - this->hdr.addr - 15;
 
   buf += 16;
 
@@ -138,19 +138,19 @@ void Subsection<X86_64>::scan_relocations(Context<X86_64> &ctx) {
 
     switch (r.type) {
     case X86_64_RELOC_GOT_LOAD:
-      if (sym->file && sym->file->is_dylib)
+      if (sym->file && sym->file->is_dylib())
         sym->flags |= NEEDS_GOT;
       break;
     case X86_64_RELOC_GOT:
       sym->flags |= NEEDS_GOT;
       break;
     case X86_64_RELOC_TLV:
-      if (sym->file && sym->file->is_dylib)
+      if (sym->file && sym->file->is_dylib())
         sym->flags |= NEEDS_THREAD_PTR;
       break;
     }
 
-    if (sym->file && sym->file->is_dylib) {
+    if (sym->file && sym->file->is_dylib()) {
       sym->flags |= NEEDS_STUB;
       ((DylibFile<X86_64> *)sym->file)->is_needed = true;
     }

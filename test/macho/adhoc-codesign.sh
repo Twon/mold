@@ -1,14 +1,16 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/ld64.mold"
-t="$(pwd)/out/test/macho/$testname"
-mkdir -p "$t"
+t=out/test/macho/$testname
+mkdir -p $t
 
-cat <<EOF | cc -o "$t"/exe -xc - -Wl,-adhoc_codesign
+cat <<EOF | $CC -o $t/exe -xc - -Wl,-adhoc_codesign
 #include <stdio.h>
 
 int main() {
@@ -16,6 +18,6 @@ int main() {
 }
 EOF
 
-"$t"/exe | fgrep -q 'Hello world'
+$t/exe | fgrep -q 'Hello world'
 
 echo OK

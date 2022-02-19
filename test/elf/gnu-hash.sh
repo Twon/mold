@@ -1,21 +1,21 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
-cat <<EOF | c++ -o "$t"/exe -Wl,-hash-style=gnu -xc++ -
-#include <iostream>
-
-int main() {
-  std::cout << "foo\n";
-}
+cat <<EOF | $CC -c -o $t/a.o -xc -
+void foo() {}
+void bar() {}
+static void baz() {}
 EOF
 
-"$t"/exe | grep -q foo
+$CC -B. -o $t/b.so $t/a.o -Wl,-hash-style=gnu -shared
 
 echo OK

@@ -53,6 +53,7 @@
 // thread and even better with multiple threads.
 
 #include "mold.h"
+#include "../sha.h"
 
 #include <array>
 #include <tbb/concurrent_unordered_map.h>
@@ -61,13 +62,6 @@
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_sort.h>
-
-#ifdef __APPLE__
-#  define COMMON_DIGEST_FOR_OPENSSL
-#  include <CommonCrypto/CommonDigest.h>
-#else
-#  include <openssl/sha.h>
-#endif
 
 static constexpr int64_t HASH_SIZE = 16;
 
@@ -105,7 +99,7 @@ static void uniquify_cies(Context<E> &ctx) {
 
 template <typename E>
 static bool is_eligible(InputSection<E> &isec) {
-  const ElfShdr<E> &shdr = isec.shdr;
+  const ElfShdr<E> &shdr = isec.shdr();
   std::string_view name = isec.name();
 
   bool is_alloc = (shdr.sh_flags & SHF_ALLOC);
@@ -263,7 +257,7 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
   };
 
   hash_string(isec.contents);
-  hash(isec.shdr.sh_flags);
+  hash(isec.shdr().sh_flags);
   hash(isec.get_fdes().size());
   hash(isec.get_rels(ctx).size());
 
@@ -358,6 +352,9 @@ static void gather_edges(Context<E> &ctx,
                          std::vector<u32> &edges,
                          std::vector<u32> &edge_indices) {
   Timer t(ctx, "gather_edges");
+
+  if (sections.empty())
+    return;
 
   std::vector<i64> num_edges(sections.size());
   edge_indices.resize(sections.size());
@@ -559,7 +556,7 @@ void icf_sections(Context<E> &ctx) {
     });
 
     // Since free'ing the map is slow, postpone it.
-    ctx.on_exit.push_back([=]() { delete map; });
+    ctx.on_exit.push_back([=] { delete map; });
   }
 
   if (ctx.arg.print_icf_sections)
@@ -588,5 +585,6 @@ void icf_sections(Context<E> &ctx) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

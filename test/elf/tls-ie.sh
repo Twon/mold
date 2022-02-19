@@ -1,12 +1,14 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
 if [ "$(uname -m)" = x86_64 ]; then
   dialect=gnu
@@ -17,7 +19,7 @@ else
   exit 0
 fi
 
-cat <<EOF | gcc -ftls-model=initial-exec -mtls-dialect=$dialect -fPIC -c -o "$t"/a.o -xc -
+cat <<EOF | gcc -ftls-model=initial-exec -mtls-dialect=$dialect -fPIC -c -o $t/a.o -xc -
 #include <stdio.h>
 
 static _Thread_local int foo;
@@ -33,9 +35,9 @@ void print() {
 }
 EOF
 
-clang -fuse-ld="$mold" -shared -o "$t"/b.so "$t"/a.o
+$CC -B. -shared -o $t/b.so $t/a.o
 
-cat <<EOF | gcc -c -o "$t"/c.o -xc -
+cat <<EOF | gcc -c -o $t/c.o -xc -
 #include <stdio.h>
 
 _Thread_local int baz;
@@ -52,10 +54,10 @@ int main() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/b.so "$t"/c.o
-"$t"/exe | grep -q '^0 0 3 5 7$'
+$CC -B. -o $t/exe $t/b.so $t/c.o
+$t/exe | grep -q '^0 0 3 5 7$'
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/b.so "$t"/c.o -Wl,-no-relax
-"$t"/exe | grep -q '^0 0 3 5 7$'
+$CC -B. -o $t/exe $t/b.so $t/c.o -Wl,-no-relax
+$t/exe | grep -q '^0 0 3 5 7$'
 
 echo OK

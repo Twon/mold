@@ -11,7 +11,7 @@ static std::vector<Subsection<E> *> collect_root_set(Context<E> &ctx) {
       rootset.push_back(sym->subsec);
   };
 
-  mark(intern(ctx, ctx.arg.entry));
+  mark(get_symbol(ctx, ctx.arg.entry));
 
   if (ctx.output_type == MH_DYLIB || ctx.output_type == MH_BUNDLE)
     for (ObjectFile<E> *file : ctx.objs)
@@ -84,7 +84,8 @@ static void mark(Context<E> &ctx, const std::vector<Subsection<E> *> &rootset) {
 template <typename E>
 static void sweep(Context<E> &ctx) {
   for (ObjectFile<E> *file : ctx.objs) {
-    erase(file->subsections, [](const std::unique_ptr<Subsection<E>> &subsec) {
+    std::erase_if(file->subsections,
+                  [](const std::unique_ptr<Subsection<E>> &subsec) {
       return !subsec->is_alive;
     });
   }

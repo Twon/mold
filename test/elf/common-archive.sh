@@ -1,49 +1,57 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
-cat <<EOF | cc -fcommon -xc -c -o "$t"/a.o -
+cat <<EOF | $CC -fcommon -xc -c -o $t/a.o -
 #include <stdio.h>
 
 int foo;
 int bar;
+extern int baz;
 __attribute__((weak)) int two();
 
 int main() {
-  printf("%d %d %d\n", foo, bar, two ? two() : -1);
+  printf("%d %d %d %d\n", foo, bar, baz, two ? two() : -1);
 }
 EOF
 
-cat <<EOF | cc -fcommon -xc -c -o "$t"/b.o -
+cat <<EOF | $CC -fcommon -xc -c -o $t/b.o -
 int foo = 5;
 EOF
 
-cat <<EOF | cc -fcommon -xc -c -o "$t"/c.o -
+cat <<EOF | $CC -fcommon -xc -c -o $t/c.o -
 int bar;
 int two() { return 2; }
 EOF
 
-rm -f "$t"/d.a
-ar rcs "$t"/d.a "$t"/b.o "$t"/c.o
+cat <<EOF | $CC -fcommon -xc -c -o $t/d.o -
+int baz;
+EOF
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o "$t"/d.a
-"$t"/exe | grep -q '5 0 -1'
+rm -f $t/e.a
+ar rcs $t/e.a $t/b.o $t/c.o $t/d.o
 
-cat <<EOF | cc -fcommon -xc -c -o "$t"/e.o -
+$CC -B. -o $t/exe $t/a.o $t/e.a
+$t/exe | grep -q '5 0 0 -1'
+
+cat <<EOF | $CC -fcommon -xc -c -o $t/f.o -
 int bar = 0;
+int baz = 7;
 int two() { return 2; }
 EOF
 
-rm -f "$t"/e.a
-ar rcs "$t"/e.a "$t"/b.o "$t"/e.o
+rm -f $t/f.a
+ar rcs $t/f.a $t/b.o $t/f.o
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o "$t"/e.a
-"$t"/exe | grep -q '5 0 2'
+$CC -B. -o $t/exe $t/a.o $t/f.a
+$t/exe | grep -q '5 0 7 2'
 
 echo OK

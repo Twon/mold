@@ -38,6 +38,7 @@ Options:
   -l LIBNAME                  Search for a given library
   -m TARGET                   Set target
   -o FILE, --output FILE      Set output filename
+  -q, --emit-relocs           Leaves relocation sections in the output
   -r, --relocatable           Generate relocatable output
   -s, --strip-all             Strip .symtab section
   -u SYMBOL, --undefined SYMBOL
@@ -60,10 +61,12 @@ Options:
   --color-diagnostics         Alias for --color-diagnostics=always
   --compress-debug-sections [none,zlib,zlib-gabi,zlib-gnu]
                               Compress .debug_* sections
+  --dc                        Ignored
   --defsym=SYMBOL=VALUE       Define a symbol alias
   --demangle                  Demangle C++ symbols in log messages (default)
     --no-demangle
   --disable-new-dtags         Ignored
+  --dp                        Ignored
   --dynamic-list              Read a list of dynamic symbols
   --eh-frame-hdr              Create .eh_frame_hdr section
     --no-eh-frame-hdr
@@ -84,6 +87,8 @@ Options:
   --image-base ADDR           Set the base address to a given value
   --init SYMBOL               Call SYMBOl at load-time
   --no-undefined              Report undefined symbols (even with --shared)
+  --pack-dyn-relocs=[relr,none]
+                              Pack dynamic relocations
   --perf                      Print performance statistics
   --pie, --pic-executable     Create a position independent executable
     --no-pie, --no-pic-executable
@@ -108,6 +113,7 @@ Options:
   --rpath-link DIR            Ignored
   --run COMMAND ARG...        Run COMMAND with mold as /usr/bin/ld
   --shared, --Bshareable      Create a share library
+  --shuffle-sections[=SEED]   Randomize the output by shuffling input sections
   --sort-common               Ignored
   --sort-section              Ignored
   --spare-dynamic-tags NUMBER Reserve give number of tags in .dynamic section
@@ -127,6 +133,8 @@ Options:
   --version-script FILE       Read version script
   --warn-common               Warn about common symbols
     --no-warn-common
+  --warn-once                 Only warn once for each undefined symbol
+  --warn-textrel              Warn if the output file needs text relocations
   --warn-unresolved-symbols   Report unresolved symbols as warnings
     --error-unresolved-symbols
                               Report unresolved symbols as errors (default)
@@ -161,8 +169,8 @@ Options:
     -z notext
     -z textoff
 
-mold: supported targets: elf32-i386 elf64-x86-64
-mold: supported emulations: elf_i386 elf_x86_64)";
+mold: supported targets: elf32-i386 elf64-x86-64 elf64-littleaarch64
+mold: supported emulations: elf_i386 elf_x86_64 aarch64linux aarch64elf)";
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Multi-letter linker options can be preceded by either a single
@@ -253,36 +261,6 @@ bool read_z_arg(Context<E> &ctx, std::span<std::string_view> &args,
   }
 
   return false;
-}
-
-template <typename E>
-std::string create_response_file(Context<E> &ctx) {
-  std::string buf;
-  std::stringstream out;
-
-  std::string cwd = std::filesystem::current_path();
-  out << "-C " << cwd.substr(1) << "\n";
-
-  if (cwd != "/") {
-    out << "--chroot ..";
-    i64 depth = std::count(cwd.begin(), cwd.end(), '/');
-    for (i64 i = 1; i < depth; i++)
-      out << "/..";
-    out << "\n";
-  }
-
-  for (i64 i = 1; i < ctx.cmdline_args.size(); i++) {
-    std::string_view arg = ctx.cmdline_args[i];
-
-    if (arg == "-repro" || arg == "--repro") {
-      i++;
-      continue;
-    }
-
-    out << arg << "\n";
-  }
-
-  return out.str();
 }
 
 template <typename E>
@@ -392,6 +370,26 @@ static bool is_file(std::string_view path) {
          (st.st_mode & S_IFMT) != S_IFDIR;
 }
 
+// Returns a PLT header size and a PLT entry size.
+template <typename E>
+static std::pair<i64, i64> get_plt_size(Context<E> &ctx) {
+  switch (E::e_machine) {
+  case EM_X86_64:
+    if (ctx.arg.z_now)
+      return {0, 8};
+    if (ctx.arg.z_ibtplt)
+      return {16, 24};
+    return {16, 16};
+  case EM_386:
+    return {16, 16};
+  case EM_AARCH64:
+    return {32, 16};
+  case EM_RISCV:
+    return {32, 16};
+  }
+  unreachable();
+}
+
 template <typename E>
 void parse_nonpositional_args(Context<E> &ctx,
                               std::vector<std::string_view> &remaining) {
@@ -402,6 +400,11 @@ void parse_nonpositional_args(Context<E> &ctx,
   ctx.page_size = E::page_size;
 
   bool version_shown = false;
+
+  // RISC-V object files contains lots of local symbols, so by default
+  // we discard them. This is compatible with GNU ld.
+  if (E::e_machine == EM_RISCV)
+    ctx.arg.discard_locals = true;
 
   while (!args.empty()) {
     std::string_view arg;
@@ -417,7 +420,7 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_arg(ctx, args, arg, "dynamic-linker") ||
                read_arg(ctx, args, arg, "I")) {
       ctx.arg.dynamic_linker = arg;
-    } else if (read_arg(ctx, args, arg, "no-dynamic-linker")) {
+    } else if (read_flag(args, "no-dynamic-linker")) {
       ctx.arg.dynamic_linker = "";
     } else if (read_flag(args, "v")) {
       SyncOut(ctx) << mold_version;
@@ -436,6 +439,8 @@ void parse_nonpositional_args(Context<E> &ctx,
         ctx.arg.emulation = EM_386;
       } else if (arg == "aarch64linux") {
         ctx.arg.emulation = EM_AARCH64;
+      } else if (arg == "elf64lriscv") {
+        ctx.arg.emulation = EM_RISCV;
       } else {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
@@ -454,12 +459,18 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.Bsymbolic_functions = false;
     } else if (read_arg(ctx, args, arg, "exclude-libs")) {
       append(ctx.arg.exclude_libs, split_by_comma_or_colon(arg));
+    } else if (read_flag(args, "q") || read_flag(args, "emit-relocs")) {
+      ctx.arg.emit_relocs = true;
     } else if (read_arg(ctx, args, arg, "e") ||
                read_arg(ctx, args, arg, "entry")) {
       ctx.arg.entry = arg;
     } else if (read_arg(ctx, args, arg, "Map")) {
       ctx.arg.Map = arg;
       ctx.arg.print_map = true;
+    } else if (read_flag(args, "print-dependencies")) {
+      ctx.arg.print_dependencies = 1;
+    } else if (read_flag(args, "print-dependencies=full")) {
+      ctx.arg.print_dependencies = 2;
     } else if (read_flag(args, "print-map") || read_flag(args, "M")) {
       ctx.arg.print_map = true;
     } else if (read_flag(args, "static") || read_flag(args, "Bstatic")) {
@@ -479,10 +490,18 @@ void parse_nonpositional_args(Context<E> &ctx,
       if (pos == arg.npos || pos == arg.size() - 1)
         Fatal(ctx) << "-defsym: syntax error: " << arg;
       ctx.arg.defsyms.push_back({arg.substr(0, pos), arg.substr(pos + 1)});
+    } else if (read_flag(args, ":lto-pass2")) {
+      ctx.arg.lto_pass2 = true;
+    } else if (read_arg(ctx, args, arg, ":ignore-ir-file")) {
+      ctx.arg.ignore_ir_file.insert(arg);
     } else if (read_flag(args, "demangle")) {
       ctx.arg.demangle = true;
     } else if (read_flag(args, "no-demangle")) {
       ctx.arg.demangle = false;
+    } else if (read_flag(args, "default-symver")) {
+      ctx.arg.default_symver = true;
+    } else if (read_flag(args, "shuffle-sections")) {
+      ctx.arg.shuffle_sections = true;
     } else if (read_arg(ctx, args, arg, "y") ||
                read_arg(ctx, args, arg, "trace-symbol")) {
       ctx.arg.trace_symbol.push_back(arg);
@@ -494,13 +513,15 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_arg(ctx, args, arg, "sysroot")) {
       ctx.arg.sysroot = arg;
     } else if (read_arg(ctx, args, arg, "unique")) {
-      auto flags = std::regex_constants::extended | std::regex_constants::optimize;
-      ctx.arg.unique.reset(new std::regex(glob_to_regex(arg), flags));
+      std::optional<GlobPattern> pat = GlobPattern::compile(arg);
+      if (!pat)
+        Fatal(ctx) << "-unique: invalid glob pattern: " << arg;
+      ctx.arg.unique = std::move(*pat);
     } else if (read_arg(ctx, args, arg, "unresolved-symbols")) {
       if (arg == "report-all" || arg == "ignore-in-shared-libs")
-        ctx.arg.unresolved_symbols = UnresolvedKind::ERROR;
+        ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
       else if (arg == "ignore-all" || arg == "ignore-in-object-files")
-        ctx.arg.unresolved_symbols = UnresolvedKind::IGNORE;
+        ctx.arg.unresolved_symbols = UNRESOLVED_IGNORE;
       else
         Fatal(ctx) << "unknown --unresolved-symbols argument: " << arg;
     } else if (read_arg(ctx, args, arg, "u") ||
@@ -551,6 +572,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.relocatable = true;
     } else if (read_flag(args, "perf")) {
       ctx.arg.perf = true;
+    } else if (read_flag(args, "pack-dyn-relocs=relr")) {
+      ctx.arg.pack_dyn_relocs_relr = true;
+    } else if (read_flag(args, "pack-dyn-relocs=none")) {
+      ctx.arg.pack_dyn_relocs_relr = false;
     } else if (read_flag(args, "stats")) {
       ctx.arg.stats = true;
       Counter::enabled = true;
@@ -577,6 +602,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.warn_common = true;
     } else if (read_flag(args, "no-warn-common")) {
       ctx.arg.warn_common = false;
+    } else if (read_flag(args, "warn-once")) {
+      ctx.arg.warn_once = true;
+    } else if (read_flag(args, "warn-textrel")) {
+      ctx.arg.warn_textrel = true;
     } else if (read_arg(ctx, args, arg, "compress-debug-sections")) {
       if (arg == "zlib" || arg == "zlib-gabi")
         ctx.arg.compress_debug_sections = COMPRESS_GABI;
@@ -601,11 +630,17 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.z_now = true;
     } else if (read_z_flag(args, "lazy")) {
       ctx.arg.z_now = false;
+    } else if (read_z_flag(args, "cet-report=none")) {
+      ctx.arg.z_cet_report = CET_REPORT_NONE;
+    } else if (read_z_flag(args, "cet-report=warning")) {
+      ctx.arg.z_cet_report = CET_REPORT_WARNING;
+    } else if (read_z_flag(args, "cet-report=error")) {
+      ctx.arg.z_cet_report = CET_REPORT_ERROR;
     } else if (read_z_flag(args, "execstack")) {
       ctx.arg.z_execstack = true;
     } else if (read_z_arg(ctx, args, arg, "max-page-size")) {
       ctx.page_size = parse_number(ctx, "-z max-page-size", arg);
-      if (__builtin_popcountll(ctx.page_size) != 1)
+      if (std::popcount<u64>(ctx.page_size) != 1)
         Fatal(ctx) << "-z max-page-size " << arg << ": value must be a power of 2";
     } else if (read_z_flag(args, "noexecstack")) {
       ctx.arg.z_execstack = false;
@@ -629,12 +664,19 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.z_initfirst = true;
     } else if (read_z_flag(args, "interpose")) {
       ctx.arg.z_interpose = true;
+    } else if (read_z_flag(args, "ibt")) {
+      ctx.arg.z_ibt = true;
+      ctx.arg.z_ibtplt = true;
+    } else if (read_z_flag(args, "ibtplt")) {
+      ctx.arg.z_ibtplt = true;
     } else if (read_z_flag(args, "muldefs")) {
       ctx.arg.allow_multiple_definition = true;
     } else if (read_z_flag(args, "keep-text-section-prefix")) {
       ctx.arg.z_keep_text_section_prefix = true;
     } else if (read_z_flag(args, "nokeep-text-section-prefix")) {
       ctx.arg.z_keep_text_section_prefix = false;
+    } else if (read_z_flag(args, "shstk")) {
+      ctx.arg.z_shstk = true;
     } else if (read_z_flag(args, "text")) {
       ctx.arg.z_text = true;
     } else if (read_z_flag(args, "notext") || read_z_flag(args, "textoff")) {
@@ -678,10 +720,6 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.icf = false;
     } else if (read_arg(ctx, args, arg, "image-base")) {
       ctx.arg.image_base = parse_number(ctx, "image-base", arg);
-    } else if (read_flag(args, "quick-exit")) {
-      ctx.arg.quick_exit = true;
-    } else if (read_flag(args, "no-quick-exit")) {
-      ctx.arg.quick_exit = false;
     } else if (read_flag(args, "print-icf-sections")) {
       ctx.arg.print_icf_sections = true;
     } else if (read_flag(args, "no-print-icf-sections")) {
@@ -690,6 +728,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.quick_exit = true;
     } else if (read_flag(args, "no-quick-exit")) {
       ctx.arg.quick_exit = false;
+    } else if (read_arg(ctx, args, arg, "plugin")) {
+      ctx.arg.plugin = arg;
+    } else if (read_arg(ctx, args, arg, "plugin-opt")) {
+      ctx.arg.plugin_opt.push_back(arg);
     } else if (read_arg(ctx, args, arg, "thread-count")) {
       ctx.arg.thread_count = parse_number(ctx, "thread-count", arg);
     } else if (read_flag(args, "threads")) {
@@ -711,9 +753,9 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_flag(args, "strip-debug") || read_flag(args, "S")) {
       ctx.arg.strip_all = true;
     } else if (read_flag(args, "warn-unresolved-symbols")) {
-      ctx.arg.unresolved_symbols = UnresolvedKind::WARN;
+      ctx.arg.unresolved_symbols = UNRESOLVED_WARN;
     } else if (read_flag(args, "error-unresolved-symbols")) {
-      ctx.arg.unresolved_symbols = UnresolvedKind::ERROR;
+      ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
     } else if (read_arg(ctx, args, arg, "rpath")) {
       if (!ctx.arg.rpaths.empty())
         ctx.arg.rpaths += ":";
@@ -756,7 +798,7 @@ void parse_nonpositional_args(Context<E> &ctx,
       if (arg == "binary")
         Fatal(ctx)
           << "mold does not suppor `-b binary`. If you want to convert a binary"
-          " file into an object file, use `objcopy -I binary -O elf64-x86-64"
+          << " file into an object file, use `objcopy -I binary -O default"
           << " <input-file> <output-file.o>` instead.";
       Fatal(ctx) << "unknown command line option: -b " << arg;
     } else if (read_arg(ctx, args, arg, "auxiliary") ||
@@ -775,8 +817,6 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_flag(args, "O1")) {
     } else if (read_flag(args, "O2")) {
     } else if (read_flag(args, "verbose")) {
-    } else if (read_arg(ctx, args, arg, "plugin")) {
-    } else if (read_arg(ctx, args, arg, "plugin-opt")) {
     } else if (read_flag(args, "color-diagnostics")) {
     } else if (read_flag(args, "gdb-index")) {
     } else if (read_flag(args, "eh-frame-hdr")) {
@@ -796,6 +836,9 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_flag(args, "no-undefined-version")) {
     } else if (read_arg(ctx, args, arg, "sort-section")) {
     } else if (read_flag(args, "sort-common")) {
+    } else if (read_flag(args, "dc")) {
+    } else if (read_flag(args, "dp")) {
+    } else if (read_flag(args, "fix-cortex-a53-835769")) {
     } else if (read_flag(args, "fix-cortex-a53-843419")) {
     } else if (read_flag(args, "EL")) {
     } else if (read_flag(args, "warn-once")) {
@@ -887,9 +930,18 @@ void parse_nonpositional_args(Context<E> &ctx,
     ctx.arg.output = "a.out";
 
   if (ctx.arg.shared || ctx.arg.export_dynamic)
-    ctx.arg.default_version = VER_NDX_GLOBAL;
+    ctx.default_version = VER_NDX_GLOBAL;
   else
-    ctx.arg.default_version = VER_NDX_LOCAL;
+    ctx.default_version = VER_NDX_LOCAL;
+
+  if (ctx.arg.default_symver) {
+    std::string ver = ctx.arg.soname.empty() ?
+      filepath(ctx.arg.output).filename().string() : std::string(ctx.arg.soname);
+    ctx.arg.version_definitions.push_back(ver);
+    ctx.default_version = VER_NDX_LAST_RESERVED + 1;
+  }
+
+  std::tie(ctx.plt_hdr_size, ctx.plt_size) = get_plt_size(ctx);
 
   ctx.arg.undefined.push_back(ctx.arg.entry);
 
@@ -909,8 +961,6 @@ void parse_nonpositional_args(Context<E> &ctx,
                 std::string_view &arg,                                  \
                 std::string name);                                      \
                                                                         \
-  template std::string create_response_file(Context<E> &ctx);           \
-                                                                        \
   template                                                              \
   void parse_nonpositional_args(Context<E> &ctx,                        \
                                 std::vector<std::string_view> &remaining)
@@ -918,5 +968,6 @@ void parse_nonpositional_args(Context<E> &ctx,
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

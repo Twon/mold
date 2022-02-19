@@ -1,27 +1,29 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
-cat <<EOF | clang -c -o "$t"/a.o -xc -
+cat <<EOF | $CC -c -o $t/a.o -xc -
 int foo();
 int main() {
   foo();
 }
 EOF
 
-! clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o 2>&1 \
+! $CC -B. -o $t/exe $t/a.o 2>&1 \
   | grep -q 'undefined symbol:.*foo'
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o --warn-unresolved-symbols 2>&1 \
+$CC -B. -o $t/exe $t/a.o -Wl,-warn-unresolved-symbols 2>&1 \
   | grep -q 'undefined symbol:.*foo'
 
-! clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o --warn-unresolved-symbols \
+! $CC -B. -o $t/exe $t/a.o -Wl,-warn-unresolved-symbols \
   --error-unresolved-symbols 2>&1 \
   | grep -q 'undefined symbol:.*foo'
 

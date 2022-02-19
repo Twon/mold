@@ -1,21 +1,23 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
-cat <<'EOF' | clang -c -o "$t"/a.o -xc -
+cat <<'EOF' | $CC -c -o $t/a.o -xc -
 __attribute__((section("foo")))
 char data[] = "section foo";
 EOF
 
-ar rcs "$t"/b.a "$t"/a.o
+ar rcs $t/b.a $t/a.o
 
-cat <<EOF | clang -c -o "$t"/c.o -xc -
+cat <<EOF | $CC -c -o $t/c.o -xc -
 #include <stdio.h>
 
 extern char data[];
@@ -27,10 +29,10 @@ int main() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/c.o "$t"/b.a
-"$t"/exe | grep -q 'section foo section foo'
+$CC -B. -o $t/exe $t/c.o $t/b.a
+$t/exe | grep -q 'section foo section foo'
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/c.o "$t"/b.a -Wl,-gc-sections
-"$t"/exe | grep -q 'section foo section foo'
+$CC -B. -o $t/exe $t/c.o $t/b.a -Wl,-gc-sections
+$t/exe | grep -q 'section foo section foo'
 
 echo OK

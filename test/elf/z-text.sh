@@ -1,21 +1,23 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
 # Skip if libc is musl
-echo 'int main() {}' | cc -o "$t"/exe -xc -
-ldd "$t"/exe | grep -q ld-musl && { echo OK; exit; }
+echo 'int main() {}' | $CC -o $t/exe -xc -
+ldd $t/exe | grep -q ld-musl && { echo OK; exit; }
 
 # Skip if target is not x86-64
 [ "$(uname -m)" = x86_64 ] || { echo skipped; exit; }
 
-cat <<'EOF' | clang -c -o "$t"/a.o -x assembler -
+cat <<'EOF' | $CC -c -o $t/a.o -x assembler -
 .globl fn1
 fn1:
   sub $8, %rsp
@@ -25,7 +27,7 @@ fn1:
   ret
 EOF
 
-cat <<EOF | clang -c -o "$t"/b.o -xc -
+cat <<EOF | $CC -c -o $t/b.o -fPIC -xc -
 #include <stdio.h>
 
 int fn1();
@@ -41,10 +43,10 @@ int main() {
 }
 EOF
 
-clang -fuse-ld="$mold" -pie -o "$t"/exe "$t"/a.o "$t"/b.o
-"$t"/exe | grep -q 3
+$CC -B. -pie -o $t/exe $t/a.o $t/b.o
+$t/exe | grep -q 3
 
-readelf --dynamic "$t"/exe | fgrep -q '(TEXTREL)'
-readelf --dynamic "$t"/exe | grep -q '\(FLAGS\).*TEXTREL'
+readelf --dynamic $t/exe | fgrep -q '(TEXTREL)'
+readelf --dynamic $t/exe | grep -q '\(FLAGS\).*TEXTREL'
 
 echo OK

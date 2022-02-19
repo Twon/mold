@@ -1,18 +1,23 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
+
+# IFUNC is not supported on RISC-V yet
+[ "$(uname -m)" = riscv64 ] && { echo skipped; exit; }
 
 # Skip if libc is musl because musl does not support GNU FUNC
-echo 'int main() {}' | cc -o "$t"/exe -xc -
-ldd "$t"/exe | grep -q ld-musl && { echo OK; exit; }
+echo 'int main() {}' | $CC -o $t/exe -xc -
+ldd $t/exe | grep -q ld-musl && { echo OK; exit; }
 
-cat <<EOF | cc -o "$t"/a.o -c -xc -
+cat <<EOF | $CC -o $t/a.o -c -xc -
 #include <stdio.h>
 
 __attribute__((ifunc("resolve_foobar")))
@@ -33,7 +38,7 @@ int main() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o
-"$t"/exe | grep -q 'Hello world'
+$CC -B. -o $t/exe $t/a.o
+$t/exe | grep -q 'Hello world'
 
 echo OK

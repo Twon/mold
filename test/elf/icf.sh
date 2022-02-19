@@ -1,14 +1,16 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
-cat <<EOF | cc -c -o "$t"/a.o -ffunction-sections -fdata-sections -xc -
+cat <<EOF | $CC -c -o $t/a.o -ffunction-sections -fdata-sections -xc -
 #include <stdio.h>
 
 int bar() {
@@ -34,7 +36,7 @@ int main() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o -Wl,-icf=all
-"$t"/exe | grep -q '1 0'
+$CC -B. -o $t/exe $t/a.o -Wl,-icf=all
+$t/exe | grep -q '1 0'
 
 echo OK

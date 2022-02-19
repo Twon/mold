@@ -1,12 +1,14 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
 if [ "$(uname -m)" = x86_64 ]; then
   dialect=gnu2
@@ -17,7 +19,7 @@ else
   exit 0
 fi
 
-cat <<EOF | gcc -fPIC -mtls-dialect=$dialect -c -o "$t"/a.o -xc -
+cat <<EOF | gcc -fPIC -mtls-dialect=$dialect -c -o $t/a.o -xc -
 extern _Thread_local int foo;
 
 int get_foo() {
@@ -31,7 +33,7 @@ int get_bar() {
 }
 EOF
 
-cat <<EOF | gcc -fPIC -mtls-dialect=$dialect -c -o "$t"/b.o -xc -
+cat <<EOF | gcc -fPIC -mtls-dialect=$dialect -c -o $t/b.o -xc -
 #include <stdio.h>
 
 _Thread_local int foo;
@@ -46,18 +48,18 @@ int main() {
 }
 EOF
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o "$t"/b.o
-"$t"/exe | grep -q '42 5'
+$CC -B. -o $t/exe $t/a.o $t/b.o
+$t/exe | grep -q '42 5'
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o "$t"/b.o -Wl,-no-relax
-"$t"/exe | grep -q '42 5'
+$CC -B. -o $t/exe $t/a.o $t/b.o -Wl,-no-relax
+$t/exe | grep -q '42 5'
 
-clang -fuse-ld="$mold" -shared -o "$t"/c.so "$t"/a.o
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/b.o "$t"/c.so
-"$t"/exe | grep -q '42 5'
+$CC -B. -shared -o $t/c.so $t/a.o
+$CC -B. -o $t/exe $t/b.o $t/c.so
+$t/exe | grep -q '42 5'
 
-clang -fuse-ld="$mold" -shared -o "$t"/c.so "$t"/a.o -Wl,-no-relax
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/b.o "$t"/c.so -Wl,-no-relax
-"$t"/exe | grep -q '42 5'
+$CC -B. -shared -o $t/c.so $t/a.o -Wl,-no-relax
+$CC -B. -o $t/exe $t/b.o $t/c.so -Wl,-no-relax
+$t/exe | grep -q '42 5'
 
 echo OK

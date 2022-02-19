@@ -1,17 +1,19 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
 # Skip if target is not x86-64
 [ "$(uname -m)" = x86_64 ] || { echo skipped; exit; }
 
-cat <<'EOF' | cc -o "$t"/a.o -c -x assembler -
+cat <<'EOF' | $CC -o $t/a.o -c -x assembler -
   .text
   .globl main
 main:
@@ -33,7 +35,7 @@ main:
   .string "foo world\n"
 EOF
 
-clang -fuse-ld="$mold" -static -o "$t"/exe "$t"/a.o
-"$t"/exe | grep -q 'Hello world'
+$CC -B. -static -o $t/exe $t/a.o
+$t/exe | grep -q 'Hello world'
 
 echo OK

@@ -1,14 +1,16 @@
 #!/bin/bash
 export LANG=
 set -e
-testname=$(basename -s .sh "$0")
+CC="${CC:-cc}"
+CXX="${CXX:-c++}"
+testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
-t="$(pwd)/out/test/elf/$testname"
-mkdir -p "$t"
+t=out/test/elf/$testname
+mkdir -p $t
 
-cat <<EOF | cc -c -o "$t"/a.o -x assembler -
+cat <<EOF | $CC -c -o $t/a.o -x assembler -
 .section .data.foo.1,"aw",@progbits
 .ascii "a"
 .section .data.foo.1,"aw",@progbits
@@ -25,10 +27,10 @@ _start:
   nop
 EOF
 
-clang -fuse-ld="$mold" -o "$t"/exe "$t"/a.o -nostdlib -Wl,-unique='*foo*'
+$CC -B. -o $t/exe $t/a.o -nostdlib -Wl,-unique='*foo*'
 
-readelf -x .data.foo.1 "$t"/exe | grep -q ab
-readelf -x .data.foo.2 "$t"/exe | grep -q c
-readelf -x .data "$t"/exe | grep -q de
+readelf -x .data.foo.1 $t/exe | grep -q ab
+readelf -x .data.foo.2 $t/exe | grep -q c
+readelf -x .data $t/exe | grep -q de
 
 echo OK

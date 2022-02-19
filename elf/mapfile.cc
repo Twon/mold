@@ -70,7 +70,7 @@ void print_map(Context<E> &ctx) {
          << std::setw(6) << (u64)osec->shdr.sh_addralign
          << " " << osec->name << "\n";
 
-    if (osec->kind != Chunk<E>::REGULAR)
+    if (!osec->is_output_section())
       continue;
 
     std::span<InputSection<E> *> members = ((OutputSection<E> *)osec)->members;
@@ -82,8 +82,8 @@ void print_map(Context<E> &ctx) {
       opt_demangle = ctx.arg.demangle;
 
       ss << std::setw(16) << (osec->shdr.sh_addr + mem->offset)
-         << std::setw(11) << (u64)mem->shdr.sh_size
-         << std::setw(6) << (u64)mem->shdr.sh_addralign
+         << std::setw(11) << (u64)mem->sh_size
+         << std::setw(6) << (1 << (u64)mem->p2align)
          << "         " << *mem << "\n";
 
       typename Map<E>::const_accessor acc;
@@ -107,5 +107,6 @@ void print_map(Context<E> &ctx) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

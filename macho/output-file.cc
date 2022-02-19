@@ -24,17 +24,17 @@ class MemoryMappedOutputFile : public OutputFile<E> {
 public:
   MemoryMappedOutputFile(Context<E> &ctx, std::string path, i64 filesize, i64 perm)
     : OutputFile<E>(path, filesize, true) {
-    std::string dir = filepath(path).parent_path();
-    output_tmpfile = (char *)save_string(ctx, dir + "/.mold-XXXXXX").data();
+    std::string tmp_path = filepath(path).parent_path() / ".mold-XXXXXX";
+    output_tmpfile = (char *)save_string(ctx, tmp_path).data();
 
     i64 fd = mkstemp(output_tmpfile);
     if (fd == -1)
       Fatal(ctx) << "cannot open " << output_tmpfile <<  ": " << errno_string();
 
     if (ftruncate(fd, filesize))
-      Fatal(ctx) << "ftruncate failed";
+      Fatal(ctx) << "ftruncate failed: " << errno_string();
     if (fchmod(fd, perm) == -1)
-      Fatal(ctx) << "fchmod failed";
+      Fatal(ctx) << "fchmod failed: " << errno_string();
 
     this->buf = (u8 *)mmap(nullptr, filesize, PROT_READ | PROT_WRITE,
                            MAP_SHARED, fd, 0);

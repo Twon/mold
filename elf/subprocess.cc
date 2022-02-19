@@ -1,20 +1,16 @@
 #include "mold.h"
+#include "../sha.h"
 
 #include <filesystem>
 #include <signal.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#ifdef __APPLE__
-#  define COMMON_DIGEST_FOR_OPENSSL
-#  include <CommonCrypto/CommonDigest.h>
-#else
-#  include <openssl/sha.h>
-#endif
 
 #define DAEMON_TIMEOUT 30
 
@@ -57,7 +53,7 @@ std::function<void()> fork_child() {
   // Child
   close(pipefd[0]);
 
-  return [=]() {
+  return [=] {
     char buf[] = {1};
     int n = write(pipefd[1], buf, 1);
     assert(n == 1);
@@ -216,7 +212,7 @@ void daemonize(Context<E> &ctx, std::function<void()> *wait_for_client,
 
   static i64 conn = -1;
 
-  *wait_for_client = [=, &ctx]() {
+  *wait_for_client = [=, &ctx] {
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(sock, &rfds);
@@ -243,7 +239,7 @@ void daemonize(Context<E> &ctx, std::function<void()> *wait_for_client,
     dup2(recv_fd(ctx, conn), STDERR_FILENO);
   };
 
-  *on_complete = [=]() {
+  *on_complete = [=] {
     char buf[] = {1};
     int n = write(conn, buf, 1);
     assert(n == 1);
@@ -252,11 +248,6 @@ void daemonize(Context<E> &ctx, std::function<void()> *wait_for_client,
 
 static std::string get_self_path() {
   return std::filesystem::read_symlink("/proc/self/exe");
-}
-
-static bool is_regular_file(const std::string &path) {
-  struct stat st;
-  return !stat(path.c_str(), &st) && (st.st_mode & S_IFMT) == S_IFREG;
 }
 
 template <typename E>
@@ -274,6 +265,11 @@ std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
   if (std::filesystem::is_regular_file(path, ec) && !ec)
     return path;
 #endif
+
+  // Look for ../lib/mold/mold-wrapper.so
+  path = self.parent_path() / "../lib/mold/mold-wrapper.so";
+  if (std::filesystem::is_regular_file(path, ec) && !ec)
+    return path;
 
   Fatal(ctx) << "mold-wrapper.so is missing";
 }
@@ -300,6 +296,7 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
     std::vector<char *> args;
     args.push_back(argv[0]);
     args.insert(args.end(), argv + 3, argv + argc);
+    args.push_back(nullptr);
     execv(self.c_str(), args.data());
     Fatal(ctx) << "mold -run failed: " << self << ": " << errno_string();
   }
@@ -318,5 +315,6 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

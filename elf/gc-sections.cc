@@ -11,9 +11,9 @@ namespace mold::elf {
 
 template <typename E>
 static bool is_init_fini(const InputSection<E> &isec) {
-  return isec.shdr.sh_type == SHT_INIT_ARRAY ||
-         isec.shdr.sh_type == SHT_FINI_ARRAY ||
-         isec.shdr.sh_type == SHT_PREINIT_ARRAY ||
+  return isec.shdr().sh_type == SHT_INIT_ARRAY ||
+         isec.shdr().sh_type == SHT_FINI_ARRAY ||
+         isec.shdr().sh_type == SHT_PREINIT_ARRAY ||
          isec.name().starts_with(".ctors") ||
          isec.name().starts_with(".dtors") ||
          isec.name().starts_with(".init") ||
@@ -98,11 +98,11 @@ collect_root_set(Context<E> &ctx) {
       // reduce the amount of non-memory-mapped segments, you should
       // use `strip` command, compile without debug info or use
       // -strip-all linker option.
-      if (!(isec->shdr.sh_flags & SHF_ALLOC))
+      if (!(isec->shdr().sh_flags & SHF_ALLOC))
         isec->is_visited = true;
 
       if (is_init_fini(*isec) || is_c_identifier(isec->name()) ||
-          isec->shdr.sh_type == SHT_NOTE)
+          isec->shdr().sh_type == SHT_NOTE)
         enqueue_section(isec.get());
     }
   });
@@ -115,13 +115,13 @@ collect_root_set(Context<E> &ctx) {
   });
 
   // Add sections referenced by root symbols.
-  enqueue_symbol(intern(ctx, ctx.arg.entry));
+  enqueue_symbol(get_symbol(ctx, ctx.arg.entry));
 
   for (std::string_view name : ctx.arg.undefined)
-    enqueue_symbol(intern(ctx, name));
+    enqueue_symbol(get_symbol(ctx, name));
 
   for (std::string_view name : ctx.arg.require_defined)
-    enqueue_symbol(intern(ctx, name));
+    enqueue_symbol(get_symbol(ctx, name));
 
   // .eh_frame consists of variable-length records called CIE and FDE
   // records, and they are a unit of inclusion or exclusion.
@@ -172,9 +172,11 @@ static void mark_nonalloc_fragments(Context<E> &ctx) {
   Timer t(ctx, "mark_nonalloc_fragments");
 
   tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-    for (SectionFragment<E> *frag : file->fragments)
-      if (!(frag->output_section.shdr.sh_flags & SHF_ALLOC))
-        frag->is_alive.store(true, std::memory_order_relaxed);
+    for (std::unique_ptr<MergeableSection<E>> &m : file->mergeable_sections)
+      if (m)
+        for (SectionFragment<E> *frag : m->fragments)
+          if (!(frag->output_section.shdr.sh_flags & SHF_ALLOC))
+            frag->is_alive.store(true, std::memory_order_relaxed);
   });
 }
 
@@ -195,5 +197,6 @@ void gc_sections(Context<E> &ctx) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

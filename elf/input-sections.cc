@@ -1,6 +1,7 @@
 #include "mold.h"
 
 #include <limits>
+#include <zlib.h>
 
 namespace mold::elf {
 
@@ -24,63 +25,68 @@ bool CieRecord<E>::equals(const CieRecord<E> &other) const {
   return true;
 }
 
-template <typename E>
-InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
-                              const ElfShdr<E> &shdr, std::string_view name,
-                              std::string_view contents, i64 section_idx)
-  : file(file), shdr(shdr), contents(contents), nameptr(name.data()),
-    namelen(name.size()), section_idx(section_idx) {
-  // As a special case, we want to map .ctors and .dtors to
-  // .init_array and .fini_array, respectively. However, old CRT
-  // object files are not compatible with this translation, so we need
-  // to keep them as-is if a section came from crtbegin.o or crtend.o.
-  //
-  // Yeah, this is an ugly hack, but the fundamental problem is that
-  // we have two different mechanism, ctors/dtors and init_array/fini_array
-  // for the same purpose. The latter was introduced to replace the
-  // former, but as it is often the case, the former still lingers
-  // around, so we need to keep this code to conver the old mechanism
-  // to the new one.
-  std::string s = filepath(file.filename).filename();
-  if (s != "crtbegin.o" && s != "crtend.o" &&
-      s != "crtbeginS.o" && s != "crtendS.o" &&
-      s != "crtbeginT.o" && s != "crtendT.o") {;
-    if (name == ".ctors" || name.starts_with(".ctors.")) {
-      name = ".init_array";
-    } else if (name == ".dtors" || name.starts_with(".dtors.")) {
-      name = ".fini_array";
-    }
-  }
-
-  output_section =
-    OutputSection<E>::get_instance(ctx, name, shdr.sh_type, shdr.sh_flags);
+static inline i64 to_p2align(u64 alignment) {
+  if (alignment == 0)
+    return 0;
+  return std::countr_zero(alignment);
 }
 
 template <typename E>
-void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
-  if (shdr.sh_type == SHT_NOBITS || shdr.sh_size == 0)
+InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
+                              std::string_view name, i64 section_idx)
+  : file(file), nameptr(name.data()), namelen(name.size()),
+    section_idx(section_idx) {
+  if (section_idx < file.elf_sections.size())
+    contents = {(char *)file.mf->data + shdr().sh_offset, shdr().sh_size};
+
+  if (name.starts_with(".zdebug")) {
+    sh_size = *(ubig64 *)&contents[4];
+    p2align = to_p2align(shdr().sh_addralign);
+  } else if (shdr().sh_flags & SHF_COMPRESSED) {
+    ElfChdr<E> &chdr = *(ElfChdr<E> *)&contents[0];
+    sh_size = chdr.ch_size;
+    p2align = to_p2align(chdr.ch_addralign);
+  } else {
+    sh_size = shdr().sh_size;
+    p2align = to_p2align(shdr().sh_addralign);
+  }
+
+  output_section =
+    OutputSection<E>::get_instance(ctx, name, shdr().sh_type, shdr().sh_flags);
+}
+
+template <typename E>
+bool InputSection<E>::is_compressed() {
+  return name().starts_with(".zdebug") || (shdr().sh_flags & SHF_COMPRESSED);
+}
+
+template <typename E>
+void InputSection<E>::uncompress(Context<E> &ctx, u8 *buf) {
+  auto do_uncompress = [&](std::string_view data) {
+    unsigned long size = sh_size;
+    if (::uncompress(buf, &size, (u8 *)data.data(), data.size()) != Z_OK)
+      Fatal(ctx) << *this << ": uncompress failed";
+    assert(size == sh_size);
+  };
+
+  if (name().starts_with(".zdebug")) {
+    // Old-style compressed section
+    if (!contents.starts_with("ZLIB") || contents.size() <= 12)
+      Fatal(ctx) << *this << ": corrupted compressed section";
+    do_uncompress(contents.substr(12));
     return;
+  }
 
-  // Copy data
-  memcpy(buf, contents.data(), contents.size());
+  assert(shdr().sh_flags & SHF_COMPRESSED);
 
-  // Apply relocations
-  if (shdr.sh_flags & SHF_ALLOC)
-    apply_reloc_alloc(ctx, buf);
-  else
-    apply_reloc_nonalloc(ctx, buf);
+  // New-style compressed section
+  if (contents.size() < sizeof(ElfChdr<E>))
+    Fatal(ctx) << *this << ": corrupted compressed section";
 
-  // As a special case, .ctors and .dtors section contents are
-  // reversed. These sections are now obsolete and mapped to
-  // .init_array and .fini_array, but they have to be reversed to
-  // maintain the original semantics.
-  bool init_fini = output_section->name == ".init_array" ||
-                   output_section->name == ".fini_array";
-  bool ctors_dtors = name().starts_with(".ctors") ||
-                     name().starts_with(".dtors");
-  if (init_fini && ctors_dtors)
-    std::reverse((typename E::WordTy *)buf,
-                 (typename E::WordTy *)(buf + shdr.sh_size));
+  ElfChdr<E> &hdr = *(ElfChdr<E> *)&contents[0];
+  if (hdr.ch_type != ELFCOMPRESS_ZLIB)
+    Fatal(ctx) << *this << ": unsupported compression type";
+  do_uncompress(contents.substr(sizeof(ElfChdr<E>)));
 }
 
 template <typename E>
@@ -93,8 +99,8 @@ static i64 get_output_type(Context<E> &ctx) {
 }
 
 template <typename E>
-static i64 get_sym_type(Context<E> &ctx, Symbol<E> &sym) {
-  if (sym.is_absolute(ctx))
+static i64 get_sym_type(Symbol<E> &sym) {
+  if (sym.is_absolute())
     return 0;
   if (!sym.is_imported)
     return 1;
@@ -106,13 +112,22 @@ static i64 get_sym_type(Context<E> &ctx, Symbol<E> &sym) {
 template <typename E>
 void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
                                const ElfRel<E> &rel, Symbol<E> &sym) {
-  Action action = table[get_output_type(ctx)][get_sym_type(ctx, sym)];
-  bool is_code = (shdr.sh_flags & SHF_EXECINSTR);
-  bool is_writable = (shdr.sh_flags & SHF_WRITE);
+  Action action = table[get_output_type(ctx)][get_sym_type(sym)];
+  bool is_writable = (shdr().sh_flags & SHF_WRITE);
 
-  auto error = [&]() {
-    Error(ctx) << *this << ": " << rel << " relocation against symbol `"
-               << sym << "' can not be used; recompile with -fPIC";
+  auto error = [&] {
+    if (sym.is_absolute())
+      Error(ctx) << *this << ": " << rel << " relocation against symbol `"
+                 << sym << "' can not be used; recompile with -fno-PIC";
+    else
+      Error(ctx) << *this << ": " << rel << " relocation against symbol `"
+                 << sym << "' can not be used; recompile with -fPIC";
+  };
+
+  auto warn_textrel = [&] {
+    if (ctx.arg.warn_textrel)
+      Warn(ctx) << *this << ": relocation against symbol `" << sym
+                << "' in read-only section";
   };
 
   switch (action) {
@@ -126,12 +141,15 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
       error();
       return;
     }
+
     if (sym.esym().st_visibility == STV_PROTECTED) {
       Error(ctx) << *this
                  << ": cannot make copy relocation for protected symbol '"
-                 << sym << "', defined in " << *sym.file;
+                 << sym << "', defined in " << *sym.file
+                 << "; recompile with -fPIC";
       return;
     }
+
     sym.flags |= NEEDS_COPYREL;
     return;
   case PLT:
@@ -139,26 +157,31 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
     return;
   case DYNREL:
     if (!is_writable) {
-      if (!is_code || ctx.arg.z_text) {
+      if (ctx.arg.z_text) {
         error();
         return;
       }
+      warn_textrel();
       ctx.has_textrel = true;
     }
-    sym.flags |= NEEDS_DYNSYM;
+
+    assert(sym.is_imported);
     needs_dynrel[i] = true;
     file.num_dynrel++;
     return;
   case BASEREL:
     if (!is_writable) {
-      if (!is_code || ctx.arg.z_text) {
+      if (ctx.arg.z_text) {
         error();
         return;
       }
+      warn_textrel();
       ctx.has_textrel = true;
     }
+
     needs_baserel[i] = true;
-    file.num_dynrel++;
+    if (!is_relr_reloc(ctx, rel))
+      file.num_dynrel++;
     return;
   default:
     unreachable();
@@ -166,25 +189,53 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
 }
 
 template <typename E>
-void InputSection<E>::report_undef(Context<E> &ctx, Symbol<E> &sym) {
+void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
+  if (shdr().sh_type == SHT_NOBITS || sh_size == 0)
+    return;
+
+  // Copy data
+  if constexpr (E::e_machine == EM_RISCV) {
+    copy_contents_riscv(ctx, buf);
+  } else {
+    if (is_compressed())
+      uncompress(ctx, buf);
+    else
+      memcpy(buf, contents.data(), contents.size());
+  }
+
+  // Apply relocations
+  if (shdr().sh_flags & SHF_ALLOC)
+    apply_reloc_alloc(ctx, buf);
+  else
+    apply_reloc_nonalloc(ctx, buf);
+}
+
+template <typename E>
+void report_undef(Context<E> &ctx, InputFile<E> &file, Symbol<E> &sym) {
+  if (ctx.arg.warn_once && !ctx.warned.insert({(void *)&sym, 1}))
+    return;
+
   switch (ctx.arg.unresolved_symbols) {
-  case UnresolvedKind::ERROR:
+  case UNRESOLVED_ERROR:
     Error(ctx) << "undefined symbol: " << file << ": " << sym;
     break;
-  case UnresolvedKind::WARN:
+  case UNRESOLVED_WARN:
     Warn(ctx) << "undefined symbol: " << file << ": " << sym;
     break;
-  case UnresolvedKind::IGNORE:
+  case UNRESOLVED_IGNORE:
     break;
   }
 }
 
-#define INSTANTIATE(E)                          \
-  template struct CieRecord<E>;                 \
-  template class InputSection<E>;
+#define INSTANTIATE(E)                                                  \
+  template struct CieRecord<E>;                                         \
+  template class InputSection<E>;                                       \
+  template void report_undef(Context<E> &, InputFile<E> &, Symbol<E> &)
+
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

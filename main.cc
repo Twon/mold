@@ -4,20 +4,18 @@
 #include <cstring>
 #include <signal.h>
 
-namespace mold {
+#ifdef USE_SYSTEM_MIMALLOC
+#include <mimalloc-new-delete.h>
+#endif
 
-std::string_view errno_string() {
-  static thread_local char buf[200];
-  strerror_r(errno, buf, sizeof(buf));
-  return buf;
-}
+namespace mold {
 
 #ifdef GIT_HASH
 const std::string mold_version =
-  "mold " MOLD_VERSION " (" GIT_HASH "; compatible with GNU ld and GNU gold)";
+  "mold " MOLD_VERSION " (" GIT_HASH "; compatible with GNU ld)";
 #else
 const std::string mold_version =
-  "mold " MOLD_VERSION " (compatible with GNU ld and GNU gold)";
+  "mold " MOLD_VERSION " (compatible with GNU ld)";
 #endif
 
 void cleanup() {
