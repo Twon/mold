@@ -2,21 +2,25 @@ target_sources(mold
     PRIVATE
         arch-arm64.cc
         arch-i386.cc
+        arch-riscv64.cc
         arch-x86-64.cc
         cmdline.cc
         elf.h
         gc-sections.cc
+        glob.cc
         icf.cc
+        input-files.cc
         input-sections.cc
         linker-script.cc
+        lto.cc
         main.cc
         mapfile.cc
         mold-wrapper.c
         mold.h
-        object-file.cc
         output-chunks.cc
         output-file.cc
         passes.cc
         relocatable.cc
         subprocess.cc
+        version-matcher.cc
 )

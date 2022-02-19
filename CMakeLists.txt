@@ -36,15 +36,20 @@ target_include_directories(mold
 
 target_sources(mold
     PRIVATE
+        archive-file.h
         byteorder.h
         cmdline.h
         compress.cc
         demangle.cc
         filepath.cc
+        filetype.h
         hyperloglog.cc
+        lto.h
         main.cc
         mold.h
         perf.cc
+        sha.h
+        strerror.cc
         tar.cc
 )
 
