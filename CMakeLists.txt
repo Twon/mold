@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14 FATAL_ERROR)
 
-set(MOLD_VERSION 0.9.6)
+set(MOLD_VERSION 1.0.3)
 
 project(mold LANGUAGES CXX VERSION ${MOLD_VERSION})
 
@@ -8,6 +8,7 @@ project(mold LANGUAGES CXX VERSION ${MOLD_VERSION})
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_BINARY_DIR})
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(mimalloc REQUIRED)
 find_package(Threads REQUIRED)
 find_package(TBB REQUIRED)
 find_package(xxHash REQUIRED)
@@ -20,13 +21,30 @@ include(GNUInstallDirs)
 include(CMakeDependentOption)
 include(CMakePackageConfigHelpers)
 
-#cmake_dependent_option(ENABLE_CODE_COVERAGE "Enable code coverage" ON "\"${CMAKE_CXX_COMPILER_ID}\" STREQUAL \"Clang\" OR \"${CMAKE_CXX_COMPILER_ID}\" STREQUAL \"GNU\"" OFF)
-#cmake_dependent_option(ENABLE_INCLUDE_NATVIS "Enable inclusion of a natvis file for debugging" ON "\"${CMAKE_CXX_COMPILER_ID}\" STREQUAL \"MSVC\"" OFF)
-#option(ENABLE_SANITIZERS "Enable Address Sanitizer and Undefined Behaviour Sanitizer if available" OFF)
+option(USE_MIMALLOC "Enable mimalloc as a memory allocator" ON)
+option(ENABLE_LTO "Enable link-time optimisation" OFF)
+
+find_package(Git)
+find_file(GITDIR NAMES .git PATHS ${CMAKE_SOURCE_DIR} NO_DEFAULT_PATH)
+
+if (Git_FOUND AND GITDIR)
+    execute_process(
+        COMMAND ${GIT_SCM} rev-parse HEAD
+        OUTPUT_VARIABLE GIT_HEAD_SHA1
+    )
+else()
+    message(STATUS "Git not found.  GIT_HASH is not set")
+endif()
 
 add_executable(mold "")
 
-set_property(TARGET mold PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_target_properties(mold 
+    PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+        POSITION_INDEPENDENT_CODE ON
+)
 
 target_include_directories(mold
     INTERFACE
@@ -58,19 +76,28 @@ target_compile_features(mold
         cxx_std_20
 )
 
+target_compile_definitions(mold
+    PRIVATE
+        MOLD_VERSION="${MOLD_VERSION}"
+        $<$<BOOL:${USE_MIMALLOC}>:USE_SYSTEM_MIMALLOC>
+        -DGIT_HASH=${GIT_HEAD_SHA1}
+)
+
 target_compile_options(mold
     PRIVATE
+        $<$<BOOL:${ENABLE_LTO}>:-flto>
         $<$<CXX_COMPILER_ID:AppleClang>:-Wno-deprecated-declarations> # warning: 'daemon' is deprecated: first deprecated in macOS 10.5 - Use posix_spawn APIs instead.
         $<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables>
 )
 
-target_compile_definitions(mold
+target_link_options(mold
     PRIVATE
-        MOLD_VERSION="${MOLD_VERSION}"
+        $<$<BOOL:${ENABLE_LTO}>:-flto>
 )
 
 target_link_libraries(mold
     PUBLIC
+        $<$<BOOL:${USE_MIMALLOC}>:mimalloc::mimalloc>
         $<$<NOT:$<BOOL:APPLE>>:OpenSSL::Crypto>
         TBB::tbb
         Threads::Threads    
