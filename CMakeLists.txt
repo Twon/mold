@@ -29,7 +29,7 @@ find_file(GITDIR NAMES .git PATHS ${CMAKE_SOURCE_DIR} NO_DEFAULT_PATH)
 
 if (Git_FOUND AND GITDIR)
     execute_process(
-        COMMAND ${GIT_SCM} rev-parse HEAD
+        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
         OUTPUT_VARIABLE GIT_HEAD_SHA1
     )
 else()
