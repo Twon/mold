@@ -150,18 +150,18 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 #define G   (sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr)
 #define GOT ctx.got->shdr.sh_addr
 
-    if (needs_dynrel[i]) {
-      *dynrel++ = {P, R_AARCH64_ABS64, (u32)sym.get_dynsym_idx(ctx), A};
-      *(u64 *)loc = A;
-      continue;
-    }
-
-    if (needs_baserel[i] && !is_relr_reloc(ctx, rel))
-      *dynrel++ = {P, R_AARCH64_RELATIVE, 0, (i64)(S + A)};
-
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
-      *(u64 *)loc = S + A;
+      if (sym.is_absolute() || !ctx.arg.pic) {
+        *(u64 *)loc = S + A;
+      } else if (sym.is_imported) {
+        *dynrel++ = {P, R_AARCH64_ABS64, (u32)sym.get_dynsym_idx(ctx), A};
+        *(u64 *)loc = A;
+      } else {
+        if (!is_relr_reloc(ctx, rel))
+          *dynrel++ = {P, R_AARCH64_RELATIVE, 0, (i64)(S + A)};
+        *(u64 *)loc = S + A;
+      }
       continue;
     case R_AARCH64_LDST8_ABS_LO12_NC:
       *(u32 *)loc |= bits(S + A, 11, 0) << 10;
@@ -433,8 +433,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_AARCH64_ADR_PREL_PG_HI21: {
       Action table[][4] = {
         // Absolute  Local    Imported data  Imported code
-        {  NONE,     NONE,    ERROR,         ERROR },      // DSO
-        {  NONE,     NONE,    COPYREL,       PLT   },      // PIE
+        {  ERROR,    NONE,    ERROR,         ERROR },      // DSO
+        {  ERROR,    NONE,    COPYREL,       PLT   },      // PIE
         {  NONE,     NONE,    COPYREL,       PLT   },      // PDE
       };
       dispatch(ctx, table, i, rel, sym);
@@ -502,7 +502,7 @@ static bool is_reachable(Context<E> &ctx, Symbol<E> &sym,
 }
 
 // We create a thunk no further than 100 MiB from any section.
-constexpr i64 MAX_DISTANCE = 100 * 1024 * 1024;
+static constexpr i64 MAX_DISTANCE = 100 * 1024 * 1024;
 
 // We create a thunk for each 10 MiB input sections.
 static constexpr i64 GROUP_SIZE = 10 * 1024 * 1024;
@@ -627,7 +627,7 @@ static void create_thunks(Context<E> &ctx, OutputSection<E> &osec) {
   osec.shdr.sh_size = offset;
 }
 
-static void mark_thunk_symbols(Context<E> &ctx, OutputSection<E> &osec) {
+static void gc_thunk_symbols(Context<E> &ctx, OutputSection<E> &osec) {
   for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : osec.thunks) {
     i64 sz = thunk->symbols.size();
     thunk->symbol_map.resize(sz);
@@ -716,7 +716,8 @@ i64 create_range_extension_thunks(Context<E> &ctx) {
   // with an initial layout in which output sections are separated far
   // apart.
   for (i64 i = 0; Chunk<E> *chunk : ctx.chunks)
-    chunk->shdr.sh_addr = i++ << 31;
+    if (chunk->shdr.sh_flags & SHF_ALLOC)
+      chunk->shdr.sh_addr = i++ << 31;
 
   std::vector<OutputSection<E> *> sections;
   for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
@@ -732,7 +733,7 @@ i64 create_range_extension_thunks(Context<E> &ctx) {
   // Based on the current file layout, remove thunk symbols that turned
   // out to be unnecessary.
   tbb::parallel_for_each(sections, [&](OutputSection<E> *osec) {
-    mark_thunk_symbols(ctx, *osec);
+    gc_thunk_symbols(ctx, *osec);
   });
 
   // Recompute output section sizes that contain thunks. New section

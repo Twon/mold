@@ -1,5 +1,5 @@
 #!/bin/bash
-export LANG=
+export LC_ALL=C
 set -e
 CC="${CC:-cc}"
 CXX="${CXX:-c++}"
@@ -51,6 +51,9 @@ $CC -B. -o $t/exe $t/a.o $t/d.so $t/e.so -m32
 $t/exe | grep -q '1 2 3 4 5 6'
 
 $CC -B. -o $t/exe $t/a.o $t/d.so $t/e.so -Wl,-no-relax -m32
+$t/exe | grep -q '1 2 3 4 5 6'
+
+$CC -B. -o $t/exe $t/a.o $t/b.o $t/c.o -static -m32
 $t/exe | grep -q '1 2 3 4 5 6'
 
 echo OK

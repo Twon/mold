@@ -1,5 +1,5 @@
 #!/bin/bash
-export LANG=
+export LC_ALL=C
 set -e
 CC="${CC:-cc}"
 CXX="${CXX:-c++}"
@@ -9,6 +9,8 @@ cd "$(dirname "$0")"/../..
 mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
+
+[ "$(uname -m)" = aarch64 ] && { echo skipped; exit; }
 
 cat <<EOF | $CC -fno-PIC -c -o $t/a.o -xc -
 #include <stdio.h>

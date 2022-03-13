@@ -47,11 +47,11 @@ ElfShdr<E> *InputFile<E>::find_section(i64 type) {
 }
 
 template <typename E>
-void InputFile<E>::clear_symbols(Context<E> &ctx) {
+void InputFile<E>::clear_symbols() {
   for (Symbol<E> *sym : get_global_syms()) {
     if (sym->file == this) {
       sym->file = nullptr;
-      sym->input_section = nullptr;
+      sym->shndx = 0;
       sym->value = -1;
       sym->sym_idx = -1;
       sym->ver_idx = 0;
@@ -70,14 +70,11 @@ ObjectFile<E>::ObjectFile(Context<E> &ctx, MappedFile<Context<E>> *mf,
 }
 
 template <typename E>
-ObjectFile<E>::ObjectFile() {}
-
-template <typename E>
 ObjectFile<E> *
 ObjectFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                       std::string archive_name, bool is_in_lib) {
   ObjectFile<E> *obj = new ObjectFile<E>(ctx, mf, archive_name, is_in_lib);
-  ctx.obj_pool.push_back(std::unique_ptr<ObjectFile<E>>(obj));
+  ctx.obj_pool.emplace_back(obj);
   return obj;
 }
 
@@ -205,12 +202,6 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
     if (std::unique_ptr<InputSection<E>> &target = sections[shdr.sh_info]) {
       assert(target->relsec_idx == -1);
       target->relsec_idx = i;
-
-      if (target->shdr().sh_flags & SHF_ALLOC) {
-        i64 size = shdr.sh_size / sizeof(ElfRel<E>);
-        target->needs_dynrel.resize(size);
-        target->needs_baserel.resize(size);
-      }
     }
   }
 }
@@ -225,9 +216,6 @@ void ObjectFile<E>::initialize_ehframe_sections(Context<E> &ctx) {
       isec->is_alive = false;
     }
   }
-
-  for (FdeRecord<E> &fde : fdes)
-    fde.cie = &cies[fde.cie_idx];
 }
 
 // .eh_frame contains data records explaining how to handle exceptions.
@@ -376,8 +364,10 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
 
   for (i64 i = 1; i < this->first_global; i++) {
     const ElfSym<E> &esym = this->elf_syms[i];
-    std::string_view name = symbol_strtab.data() + esym.st_name;
+    if (esym.is_common())
+      Fatal(ctx) << *this << ": common local symbol?";
 
+    std::string_view name = symbol_strtab.data() + esym.st_name;
     if (name.empty() && esym.st_type == STT_SECTION)
       if (InputSection<E> *sec = get_section(esym))
         name = sec->name();
@@ -388,11 +378,8 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
     sym.value = esym.st_value;
     sym.sym_idx = i;
 
-    if (!esym.is_abs()) {
-      if (esym.is_common())
-        Fatal(ctx) << *this << ": common local symbol?";
-      sym.input_section = get_section(esym);
-    }
+    if (!esym.is_abs())
+      sym.shndx = esym.is_abs() ? 0 : get_shndx(esym);
   }
 
   this->symbols.resize(this->elf_syms.size());
@@ -455,8 +442,8 @@ void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
     if (std::is_sorted(rels.begin(), rels.end(), less))
       continue;
 
-    sorted_rels[isec->section_idx] = {rels.begin(), rels.end()};
-    sort(sorted_rels[isec->section_idx], less);
+    sorted_rels[isec->shndx] = {rels.begin(), rels.end()};
+    sort(sorted_rels[isec->shndx], less);
   }
 }
 
@@ -610,11 +597,18 @@ void ObjectFile<E>::initialize_mergeable_sections(Context<E> &ctx) {
 
 template <typename E>
 void ObjectFile<E>::register_section_pieces(Context<E> &ctx) {
-  for (std::unique_ptr<MergeableSection<E>> &m : mergeable_sections)
-    if (m)
+  for (std::unique_ptr<MergeableSection<E>> &m : mergeable_sections) {
+    if (m) {
+      m->fragments.reserve(m->strings.size());
       for (i64 i = 0; i < m->strings.size(); i++)
         m->fragments.push_back(m->parent->insert(m->strings[i], m->hashes[i],
                                                  m->p2align));
+
+      // Shrink vectors that we will never use again to reclaim memory.
+      m->strings.clear();
+      m->hashes.clear();
+    }
+  }
 
   // Initialize rel_fragments
   for (std::unique_ptr<InputSection<E>> &isec : sections) {
@@ -813,7 +807,7 @@ void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
     std::scoped_lock lock(sym.mu);
     if (get_rank(this, esym, !this->is_alive) < get_rank(sym)) {
       sym.file = this;
-      sym.input_section = isec;
+      sym.shndx = isec ? isec->shndx : 0;
       sym.value = esym.st_value;
       sym.sym_idx = i;
       sym.ver_idx = ctx.default_version;
@@ -860,6 +854,16 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
   }
 }
 
+// Comdat groups are used to de-duplicate functions and data that may
+// be included into multiple object files. C++ compiler uses comdat
+// groups to de-duplicate instantiated templates.
+//
+// For example, if a compiler decides to instantiate `std::vector<int>`,
+// it generates code and data for `std::vector<int>` and put them into a
+// comdat group whose name is the mangled name of `std::vector<int>`.
+// The instantiation may happen multiple times for different translation
+// units. Then linker de-duplicates them so that the resulting executable
+// contains only a single copy of `std::vector<int>`.
 template <typename E>
 void ObjectFile<E>::resolve_comdat_groups() {
   for (auto &pair : comdat_groups) {
@@ -921,7 +925,7 @@ void ObjectFile<E>::claim_unresolved_symbols(Context<E> &ctx) {
 
     auto claim = [&] {
       sym.file = this;
-      sym.input_section = nullptr;
+      sym.shndx = 0;
       sym.value = 0;
       sym.sym_idx = i;
       sym.is_weak = false;
@@ -959,7 +963,7 @@ void ObjectFile<E>::claim_unresolved_symbols(Context<E> &ctx) {
 
     // Convert remaining undefined symbols to absolute symbols with value 0.
     if (ctx.arg.unresolved_symbols != UNRESOLVED_ERROR ||
-        esym.is_undef_weak()) {
+        ctx.arg.noinhibit_exec || esym.is_undef_weak()) {
       claim();
       sym.ver_idx = ctx.default_version;
       sym.is_imported = false;
@@ -1025,7 +1029,7 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
     isec->output_section = osec;
 
     sym.file = this;
-    sym.input_section = isec.get();
+    sym.shndx = idx;
     sym.value = 0;
     sym.sym_idx = i;
     sym.ver_idx = ctx.default_version;
@@ -1052,7 +1056,7 @@ static bool should_write_to_local_symtab(Context<E> &ctx, Symbol<E> &sym) {
     if (ctx.arg.discard_locals)
       return false;
 
-    if (InputSection<E> *isec = sym.input_section)
+    if (InputSection<E> *isec = sym.get_input_section())
       if (isec->shdr().sh_flags & SHF_MERGE)
         return false;
   }
@@ -1071,8 +1075,8 @@ void ObjectFile<E>::compute_symtab(Context<E> &ctx) {
 
     if (SectionFragment<E> *frag = sym.get_frag())
       return frag->is_alive;
-    if (sym.input_section)
-      return sym.input_section->is_alive;
+    if (InputSection<E> *isec = sym.get_input_section())
+      return isec->is_alive;
     return true;
   };
 
@@ -1121,10 +1125,10 @@ void ObjectFile<E>::write_symtab(Context<E> &ctx) {
     else
       esym.st_value = sym.get_addr(ctx);
 
-    if (sym.input_section)
-      esym.st_shndx = sym.input_section->output_section->shndx;
-    else if (sym.shndx)
-      esym.st_shndx = sym.shndx;
+    if (InputSection<E> *isec = sym.get_input_section())
+      esym.st_shndx = isec->output_section->shndx;
+    else if (sym.shndx < 0)
+      esym.st_shndx = -sym.shndx;
     else if (esym.is_undef())
       esym.st_shndx = SHN_UNDEF;
     else
@@ -1174,7 +1178,7 @@ template <typename E>
 SharedFile<E> *
 SharedFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   SharedFile<E> *obj = new SharedFile(ctx, mf);
-  ctx.dso_pool.push_back(std::unique_ptr<SharedFile<E>>(obj));
+  ctx.dso_pool.emplace_back(obj);
   return obj;
 }
 
@@ -1285,7 +1289,7 @@ void SharedFile<E>::resolve_symbols(Context<E> &ctx) {
 
     if (get_rank(this, esym, false) < get_rank(sym)) {
       sym.file = this;
-      sym.input_section = nullptr;
+      sym.shndx = 0;
       sym.value = esym.st_value;
       sym.sym_idx = i;
       sym.ver_idx = versyms[i];
@@ -1393,6 +1397,7 @@ void SharedFile<E>::write_symtab(Context<E> &ctx) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(ARM32);
 INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

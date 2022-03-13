@@ -24,44 +24,49 @@ static void write_compact_plt(Context<E> &ctx) {
 
 // The IBTPLT is a security-enhanced version of the regular PLT.
 // It uses Indirect Branch Tracking (IBT) feature which is part of
-// Intel Control-Flow Enforcement (CET). IBTPLT is slightly larger
-// than the regular PLT (24 bytes vs 16 bytes for each entry).
+// Intel Control-Flow Enforcement (CET).
 //
 // Note that our IBTPLT instruction sequence is different from the one
 // used in GNU ld. GNU's IBTPLT implementation uses two separate
 // sections (.plt and .plt.sec) in which one PLT entry takes 32 bytes
-// in total.
+// in total. Our PLT consists of just .plt and each entry is 16 bytes
+// long.
+//
+// Our PLT entry clobbers r11, but that's fine because the resolver
+// function (_dl_runtime_resolve) does not preserve r11 anyway.
 static void write_ibtplt(Context<E> &ctx) {
   u8 *buf = ctx.buf + ctx.plt->shdr.sh_offset;
 
   // Write PLT header
   static const u8 plt0[] = {
+    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+    0x41, 0x53,             // push %r11
     0xff, 0x35, 0, 0, 0, 0, // push GOTPLT+8(%rip)
     0xff, 0x25, 0, 0, 0, 0, // jmp *GOTPLT+16(%rip)
     0x0f, 0x1f, 0x40, 0x00, // nop
+    0x0f, 0x1f, 0x40, 0x00, // nop
+    0x0f, 0x1f, 0x40, 0x00, // nop
+    0x66, 0x90,             // nop
   };
 
   memcpy(buf, plt0, sizeof(plt0));
-  *(u32 *)(buf + 2) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr + 2;
-  *(u32 *)(buf + 8) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr + 4;
+  *(u32 *)(buf + 8) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 4;
+  *(u32 *)(buf + 14) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 2;
 
   // Write PLT entries
   i64 relplt_idx = 0;
 
   static const u8 data[] = {
     0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+    0x41, 0xbb, 0, 0, 0, 0, // mov $index_in_relplt, %r11d
     0xff, 0x25, 0, 0, 0, 0, // jmp *foo@GOTPLT
-    0x68, 0, 0, 0, 0,       // push $index_in_relplt
-    0xf2, 0xe9, 0, 0, 0, 0, // jmp PLT[0]
-    0x0f, 0x1f, 0x00,       // nop
   };
 
   for (Symbol<E> *sym : ctx.plt->symbols) {
     u8 *ent = buf + ctx.plt_hdr_size + sym->get_plt_idx(ctx) * ctx.plt_size;
     memcpy(ent, data, sizeof(data));
-    *(u32 *)(ent + 6) = sym->get_gotplt_addr(ctx) - sym->get_plt_addr(ctx) - 10;
-    *(u32 *)(ent + 11) = relplt_idx++;
-    *(u32 *)(ent + 17) = ctx.plt->shdr.sh_addr - sym->get_plt_addr(ctx) - 21;
+    *(u32 *)(ent + 6) = relplt_idx++;
+    *(u32 *)(ent + 12) = sym->get_gotplt_addr(ctx) - sym->get_plt_addr(ctx) - 16;
   }
 }
 
@@ -272,15 +277,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 #define G   (sym.get_got_addr(ctx) - ctx.gotplt->shdr.sh_addr)
 #define GOT ctx.gotplt->shdr.sh_addr
 
-    if (needs_dynrel[i]) {
-      *dynrel++ = {P, R_X86_64_64, (u32)sym.get_dynsym_idx(ctx), A};
-      write64(A);
-      continue;
-    }
-
-    if (needs_baserel[i] && !is_relr_reloc(ctx, rel))
-      *dynrel++ = {P, R_X86_64_RELATIVE, 0, (i64)(S + A)};
-
     switch (rel.r_type) {
     case R_X86_64_8:
       write8(S + A);
@@ -295,7 +291,16 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write32s(S + A);
       continue;
     case R_X86_64_64:
-      write64(S + A);
+      if (sym.is_absolute() || !ctx.arg.pic) {
+        write64(S + A);
+      } else if (sym.is_imported) {
+        *dynrel++ = {P, R_X86_64_64, (u32)sym.get_dynsym_idx(ctx), A};
+        write64(A);
+      } else {
+        if (!is_relr_reloc(ctx, rel))
+          *dynrel++ = {P, R_X86_64_RELATIVE, 0, (i64)(S + A)};
+        write64(S + A);
+      }
       continue;
     case R_X86_64_PC8:
       write8s(S + A - P);
@@ -307,7 +312,12 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write32s(S + A - P);
       continue;
     case R_X86_64_PC64:
-      write64(S + A - P);
+      if (sym.is_absolute() || !sym.is_imported || !ctx.arg.shared) {
+        write64(S + A - P);
+      } else {
+        *dynrel++ = {P, R_X86_64_64, (u32)sym.get_dynsym_idx(ctx), A};
+        write64(A);
+      }
       continue;
     case R_X86_64_PLT32:
       write32s(S + A - P);
@@ -360,15 +370,35 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_X86_64_TLSGD:
       if (sym.get_tlsgd_idx(ctx) == -1) {
         // Relax GD to LE
-        static const u8 insn[] = {
-          0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
-          0x48, 0x8d, 0x80, 0,    0,    0, 0,       // lea 0(%rax), %rax
-        };
-        memcpy(loc - 4, insn, sizeof(insn));
-
         i64 val = S - ctx.tls_end + A + 4;
         overflow_check(val, -((i64)1 << 31), (i64)1 << 31);
-        *(u32 *)(loc + 8) = val;
+
+        switch (rels[i + 1].r_type) {
+        case R_X86_64_PLT32:
+        case R_X86_64_GOTPCREL:
+        case R_X86_64_GOTPCRELX: {
+          static const u8 insn[] = {
+            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
+            0x48, 0x8d, 0x80, 0,    0,    0, 0,       // lea 0(%rax), %rax
+          };
+          memcpy(loc - 4, insn, sizeof(insn));
+          *(u32 *)(loc + 8) = val;
+          break;
+        }
+        case R_X86_64_PLTOFF64: {
+          static const u8 insn[] = {
+            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
+            0x48, 0x8d, 0x80, 0,    0,    0, 0,       // lea 0(%rax), %rax
+            0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00,       // nop
+          };
+          memcpy(loc - 3, insn, sizeof(insn));
+          *(u32 *)(loc + 9) = val;
+          break;
+        }
+        default:
+          unreachable();
+        }
+
         i++;
       } else {
         write32s(sym.get_tlsgd_addr(ctx) + A - P);
@@ -377,11 +407,38 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_X86_64_TLSLD:
       if (ctx.got->tlsld_idx == -1) {
         // Relax LD to LE
-        static const u8 insn[] = {
-          0x66, 0x66, 0x66,                         // (padding)
-          0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
-        };
-        memcpy(loc - 3, insn, sizeof(insn));
+        switch (rels[i + 1].r_type) {
+        case R_X86_64_PLT32: {
+          static const u8 insn[] = {
+            0x66, 0x66, 0x66,                         // (padding)
+            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
+          };
+          memcpy(loc - 3, insn, sizeof(insn));
+          break;
+        }
+        case R_X86_64_GOTPCREL:
+        case R_X86_64_GOTPCRELX: {
+          static const u8 insn[] = {
+            0x66, 0x66, 0x66,                         // (padding)
+            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
+            0x90,                                     // nop
+          };
+          memcpy(loc - 3, insn, sizeof(insn));
+          break;
+        }
+        case R_X86_64_PLTOFF64: {
+          static const u8 insn[] = {
+            0x66, 0x66, 0x66,                         // (padding)
+            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0, %rax
+            0x66, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, // nop
+          };
+          memcpy(loc - 3, insn, sizeof(insn));
+          break;
+        }
+        default:
+          unreachable();
+        }
+
         i++;
       } else {
         write32s(ctx.got->get_tlsld_addr(ctx) + A - P);
@@ -675,26 +732,36 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       dispatch(ctx, table, i, rel, sym);
       break;
     }
-    case R_X86_64_TLSGD:
+    case R_X86_64_TLSGD: {
       if (i + 1 == rels.size())
-        Fatal(ctx) << *this
-                   << ": TLSGD reloc must be followed by PLT32 or GOTPCREL";
+        Fatal(ctx) << *this << ": TLSGD reloc must be followed by PLT or GOTPCREL";
+
+      if (u32 ty = rels[i + 1].r_type;
+          ty != R_X86_64_PLT32 && ty != R_X86_64_PLTOFF64 &&
+          ty != R_X86_64_GOTPCREL && ty != R_X86_64_GOTPCRELX)
+        Fatal(ctx) << *this << ": TLSGD reloc must be followed by PLT or GOTPCREL";
 
       if (ctx.arg.relax && !ctx.arg.shared && !sym.is_imported)
         i++;
       else
         sym.flags |= NEEDS_TLSGD;
       break;
-    case R_X86_64_TLSLD:
+    }
+    case R_X86_64_TLSLD: {
       if (i + 1 == rels.size())
-        Fatal(ctx) << *this
-                   << ": TLSLD reloc must be followed by PLT32 or GOTPCREL";
+        Fatal(ctx) << *this << ": TLSLD reloc must be followed by PLT or GOTPCREL";
+
+      if (u32 ty = rels[i + 1].r_type;
+          ty != R_X86_64_PLT32 && ty != R_X86_64_PLTOFF64 &&
+          ty != R_X86_64_GOTPCREL && ty != R_X86_64_GOTPCRELX)
+        Fatal(ctx) << *this << ": TLSLD reloc must be followed by PLT or GOTPCREL";
 
       if (ctx.arg.relax && !ctx.arg.shared)
         i++;
       else
         ctx.needs_tlsld = true;
       break;
+    }
     case R_X86_64_GOTTPOFF: {
       ctx.has_gottp_rel = true;
 

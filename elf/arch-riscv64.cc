@@ -230,21 +230,21 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 #define G   (sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr)
 #define GOT ctx.got->shdr.sh_addr
 
-    if (needs_dynrel[i]) {
-      *dynrel++ = {P, R_RISCV_64, (u32)sym.get_dynsym_idx(ctx), A};
-      *(u64 *)loc = A;
-      continue;
-    }
-
-    if (needs_baserel[i] && !is_relr_reloc(ctx, rel))
-      *dynrel++ = {P, R_RISCV_RELATIVE, 0, (i64)(S + A)};
-
     switch (rel.r_type) {
     case R_RISCV_32:
       *(u32 *)loc = S + A;
       break;
     case R_RISCV_64:
-      *(u64 *)loc = S + A;
+      if (sym.is_absolute() || !ctx.arg.pic) {
+        *(u64 *)loc = S + A;
+      } else if (sym.is_imported) {
+        *dynrel++ = {P, R_RISCV_64, (u32)sym.get_dynsym_idx(ctx), A};
+        *(u64 *)loc = A;
+      } else {
+        if (!is_relr_reloc(ctx, rel))
+          *dynrel++ = {P, R_RISCV_RELATIVE, 0, (i64)(S + A)};
+        *(u64 *)loc = S + A;
+      }
       break;
     case R_RISCV_TLS_DTPMOD32:
     case R_RISCV_TLS_DTPMOD64:
@@ -295,7 +295,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       }
       break;
     case R_RISCV_PCREL_LO12_I:
-      assert(sym.input_section == this);
+      assert(sym.get_input_section() == this);
       assert(sym.value < r_offset);
       write_itype((u32 *)loc, *(u32 *)(base + sym.value));
       break;
@@ -304,7 +304,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write_itype((u32 *)loc, S + A);
       break;
     case R_RISCV_PCREL_LO12_S:
-      assert(sym.input_section == this);
+      assert(sym.get_input_section() == this);
       assert(sym.value < r_offset);
       write_stype((u32 *)loc, *(u32 *)(base + sym.value));
       break;
@@ -554,8 +554,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_HI20: {
       Action table[][4] = {
         // Absolute  Local    Imported data  Imported code
-        {  NONE,     NONE,    ERROR,         ERROR },      // DSO
-        {  NONE,     NONE,    COPYREL,       PLT   },      // PIE
+        {  NONE,     ERROR,   ERROR,         ERROR },      // DSO
+        {  NONE,     ERROR,   ERROR,         ERROR },      // PIE
         {  NONE,     NONE,    COPYREL,       PLT   },      // PDE
       };
       dispatch(ctx, table, i, rel, sym);
@@ -661,8 +661,8 @@ static void initialize_storage(Context<E> &ctx) {
 
     for (Symbol<E> *sym : file->symbols)
       if (sym->file == file)
-        if (InputSection<E> *isec = sym->input_section)
-          file->sorted_symbols[isec->section_idx].push_back(sym);
+        if (InputSection<E> *isec = sym->get_input_section())
+          file->sorted_symbols[isec->shndx].push_back(sym);
 
     for (std::vector<Symbol<E> *> &vec : file->sorted_symbols)
       sort(vec, [](Symbol<E> *a, Symbol<E> *b) { return a->value < b->value; });

@@ -43,8 +43,8 @@ Options:
   -s, --strip-all             Strip .symtab section
   -u SYMBOL, --undefined SYMBOL
                               Force to resolve SYMBOL
-  --Bdynamic                  Link against shared libraries (default)
-  --Bstatic                   Do not link against shared libraries
+  --Bdynamic, --dy            Link against shared libraries (default)
+  --Bstatic, --dn, --static   Do not link against shared libraries
   --Bsymbolic                 Bind global symbols locally
   --Bsymbolic-functions       Bind global functions locally
   --Bno-symbolic              Cancel --Bsymbolic and --Bsymbolic-functions
@@ -62,6 +62,7 @@ Options:
   --compress-debug-sections [none,zlib,zlib-gabi,zlib-gnu]
                               Compress .debug_* sections
   --dc                        Ignored
+  --dependency-file=FILE      Write Makefile-style dependency rules to FILE
   --defsym=SYMBOL=VALUE       Define a symbol alias
   --demangle                  Demangle C++ symbols in log messages (default)
     --no-demangle
@@ -87,13 +88,12 @@ Options:
   --image-base ADDR           Set the base address to a given value
   --init SYMBOL               Call SYMBOl at load-time
   --no-undefined              Report undefined symbols (even with --shared)
+  --noinhibit-exec            Create an output file even if errors occur
   --pack-dyn-relocs=[relr,none]
                               Pack dynamic relocations
   --perf                      Print performance statistics
   --pie, --pic-executable     Create a position independent executable
     --no-pie, --no-pic-executable
-  --plugin                    Ignored
-  --plugin-opt                Ignored
   --pop-state                 Pop state of flags governing input file handling
   --preload
     --no-preload
@@ -109,6 +109,7 @@ Options:
   --repro                     Embed input files to .repro section
   --require-defined SYMBOL    Require SYMBOL be defined in the final output
   --retain-symbols-file FILE  Keep only symbols listed in FILE
+  --reverse-sections          Reverses input sections in the output file
   --rpath DIR                 Add DIR to runtime search path
   --rpath-link DIR            Ignored
   --run COMMAND ARG...        Run COMMAND with mold as /usr/bin/ld
@@ -119,7 +120,6 @@ Options:
   --spare-dynamic-tags NUMBER Reserve give number of tags in .dynamic section
   --start-lib                 Give following object files in-archive-file semantics
     --end-lib                 End the effect of --start-lib
-  --static                    Do not link against shared libraries
   --stats                     Print input statistics
   --sysroot DIR               Set target system root directory
   --thread-count COUNT, --threads=COUNT
@@ -134,6 +134,7 @@ Options:
   --warn-common               Warn about common symbols
     --no-warn-common
   --warn-once                 Only warn once for each undefined symbol
+  --warn-shared-textrel       Warn if the output .so needs text relocations
   --warn-textrel              Warn if the output file needs text relocations
   --warn-unresolved-symbols   Report unresolved symbols as warnings
     --error-unresolved-symbols
@@ -212,6 +213,19 @@ bool read_arg(Context<E> &ctx, std::span<std::string_view> &args,
       return true;
     }
 
+    if (args[0].starts_with(opt + "=")) {
+      arg = args[0].substr(opt.size() + 1);
+      args = args.subspan(1);
+      return true;
+    }
+  }
+  return false;
+}
+
+template <typename E>
+bool read_eq(Context<E> &ctx, std::span<std::string_view> &args,
+             std::string_view &arg, std::string name) {
+  for (std::string opt : add_dashes(name)) {
     if (args[0].starts_with(opt + "=")) {
       arg = args[0].substr(opt.size() + 1);
       args = args.subspan(1);
@@ -370,6 +384,22 @@ static bool is_file(std::string_view path) {
          (st.st_mode & S_IFMT) != S_IFDIR;
 }
 
+template <typename E>
+static std::variant<Symbol<E> *, u64>
+parse_defsym_value(Context<E> &ctx, std::string_view s) {
+  if (s.starts_with("0x") || s.starts_with("0X")) {
+    size_t nread;
+    u64 addr = std::stoull(std::string(s), &nread, 16);
+    if (s.size() != nread)
+      return {};
+    return addr;
+  }
+
+  if (s.find_first_not_of("0123456789") == s.npos)
+    return (u64)std::stoull(std::string(s), nullptr, 10);
+  return get_symbol(ctx, s);
+}
+
 // Returns a PLT header size and a PLT entry size.
 template <typename E>
 static std::pair<i64, i64> get_plt_size(Context<E> &ctx) {
@@ -378,12 +408,14 @@ static std::pair<i64, i64> get_plt_size(Context<E> &ctx) {
     if (ctx.arg.z_now)
       return {0, 8};
     if (ctx.arg.z_ibtplt)
-      return {16, 24};
+      return {32, 16};
     return {16, 16};
   case EM_386:
     return {16, 16};
   case EM_AARCH64:
     return {32, 16};
+  case EM_ARM:
+    return {16, 16};
   case EM_RISCV:
     return {32, 16};
   }
@@ -400,6 +432,7 @@ void parse_nonpositional_args(Context<E> &ctx,
   ctx.page_size = E::page_size;
 
   bool version_shown = false;
+  bool warn_shared_textrel = false;
 
   // RISC-V object files contains lots of local symbols, so by default
   // we discard them. This is compatible with GNU ld.
@@ -439,6 +472,8 @@ void parse_nonpositional_args(Context<E> &ctx,
         ctx.arg.emulation = EM_386;
       } else if (arg == "aarch64linux") {
         ctx.arg.emulation = EM_AARCH64;
+      } else if (arg == "armelf_linux_eabi") {
+        ctx.arg.emulation = EM_ARM;
       } else if (arg == "elf64lriscv") {
         ctx.arg.emulation = EM_RISCV;
       } else {
@@ -473,10 +508,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.print_dependencies = 2;
     } else if (read_flag(args, "print-map") || read_flag(args, "M")) {
       ctx.arg.print_map = true;
-    } else if (read_flag(args, "static") || read_flag(args, "Bstatic")) {
+    } else if (read_flag(args, "Bstatic") || read_flag(args, "dn") || read_flag(args, "static")) {
       ctx.arg.is_static = true;
       remaining.push_back("-Bstatic");
-    } else if (read_flag(args, "Bdynamic")) {
+    } else if (read_flag(args, "Bdynamic") || read_flag(args, "dy")) {
       ctx.arg.is_static = false;
       remaining.push_back("-Bdynamic");
     } else if (read_flag(args, "shared") || read_flag(args, "Bshareable")) {
@@ -485,11 +520,14 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.spare_dynamic_tags = parse_number(ctx, "spare-dynamic-tags", arg);
     } else if (read_flag(args, "start-lib")) {
       remaining.push_back("-start-lib");
+    } else if (read_arg(ctx, args, arg, "dependency-file")) {
+      ctx.arg.dependency_file = arg;
     } else if (read_arg(ctx, args, arg, "defsym")) {
       size_t pos = arg.find('=');
       if (pos == arg.npos || pos == arg.size() - 1)
         Fatal(ctx) << "-defsym: syntax error: " << arg;
-      ctx.arg.defsyms.push_back({arg.substr(0, pos), arg.substr(pos + 1)});
+      ctx.arg.defsyms.emplace_back(get_symbol(ctx, arg.substr(0, pos)),
+                                   parse_defsym_value(ctx, arg.substr(pos + 1)));
     } else if (read_flag(args, ":lto-pass2")) {
       ctx.arg.lto_pass2 = true;
     } else if (read_arg(ctx, args, arg, ":ignore-ir-file")) {
@@ -500,8 +538,15 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.demangle = false;
     } else if (read_flag(args, "default-symver")) {
       ctx.arg.default_symver = true;
+    } else if (read_flag(args, "noinhibit-exec")) {
+      ctx.arg.noinhibit_exec = true;
     } else if (read_flag(args, "shuffle-sections")) {
-      ctx.arg.shuffle_sections = true;
+      ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_SHUFFLE;
+    } else if (read_eq(ctx, args, arg, "shuffle-sections")) {
+      ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_SHUFFLE;
+      ctx.arg.shuffle_sections_seed = parse_number(ctx, "shuffle-sections", arg);
+    } else if (read_flag(args, "reverse-sections")) {
+      ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_REVERSE;
     } else if (read_arg(ctx, args, arg, "y") ||
                read_arg(ctx, args, arg, "trace-symbol")) {
       ctx.arg.trace_symbol.push_back(arg);
@@ -604,6 +649,8 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.warn_common = false;
     } else if (read_flag(args, "warn-once")) {
       ctx.arg.warn_once = true;
+    } else if (read_flag(args, "warn-shared-textrel")) {
+      warn_shared_textrel = true;
     } else if (read_flag(args, "warn-textrel")) {
       ctx.arg.warn_textrel = true;
     } else if (read_arg(ctx, args, arg, "compress-debug-sections")) {
@@ -731,19 +778,69 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_arg(ctx, args, arg, "plugin")) {
       ctx.arg.plugin = arg;
     } else if (read_arg(ctx, args, arg, "plugin-opt")) {
-      ctx.arg.plugin_opt.push_back(arg);
+      ctx.arg.plugin_opt.push_back(std::string(arg));
+    } else if (read_flag(args, "lto-cs-profile-generate")) {
+      ctx.arg.plugin_opt.push_back("cs-profile-generate");
+    } else if (read_arg(ctx, args, arg, "lto-cs-profile-file")) {
+      ctx.arg.plugin_opt.push_back("cs-profile-path=" + std::string(arg));
+    } else if (read_flag(args, "lto-debug-pass-manager")) {
+      ctx.arg.plugin_opt.push_back("debug-pass-manager");
+    } else if (read_flag(args, "disable-verify")) {
+      ctx.arg.plugin_opt.push_back("disable-verify");
+    } else if (read_flag(args, "lto-emit-asm")) {
+      ctx.arg.plugin_opt.push_back("emit-asm");
+    } else if (read_arg(ctx, args, arg, "thinlto-jobs")) {
+      ctx.arg.plugin_opt.push_back("jobs=" + std::string(arg));
+    } else if (read_flag(args, "no-legacy-pass-manager")) {
+      ctx.arg.plugin_opt.push_back("legacy-pass-manager");
+    } else if (read_arg(ctx, args, arg, "lto-partitions")) {
+      ctx.arg.plugin_opt.push_back("lto-partitions=" + std::string(arg));
+    } else if (read_flag(args, "no-lto-legacy-pass-manager")) {
+      ctx.arg.plugin_opt.push_back("new-pass-manager");
+    } else if (read_arg(ctx, args, arg, "lto-obj-path")) {
+      ctx.arg.plugin_opt.push_back("obj-path=" + std::string(arg));
+    } else if (read_arg(ctx, args, arg, "opt-remarks-filename")) {
+      ctx.arg.plugin_opt.push_back("opt-remarks-filename=" + std::string(arg));
+    } else if (read_arg(ctx, args, arg, "opt-remarks-format")) {
+      ctx.arg.plugin_opt.push_back("opt-remarks-format=" + std::string(arg));
+    } else if (read_arg(ctx, args, arg, "opt-remarks-hotness-threshold")) {
+      ctx.arg.plugin_opt.push_back("opt-remarks-hotness-threshold=" + std::string(arg));
+    } else if (read_arg(ctx, args, arg, "opt-remarks-passes")) {
+      ctx.arg.plugin_opt.push_back("opt-remarks-passes=" + std::string(arg));
+    } else if (read_flag(args, "opt-remarks-with_hotness")) {
+      ctx.arg.plugin_opt.push_back("opt-remarks-with-hotness");
+    } else if (args[0].starts_with("-lto-O")) {
+      ctx.arg.plugin_opt.push_back("O" + std::string(args[0].substr(6)));
+      args = args.subspan(1);
+    } else if (args[0].starts_with("--lto-O")) {
+      ctx.arg.plugin_opt.push_back("O" + std::string(args[0].substr(7)));
+      args = args.subspan(1);
+    } else if (read_arg(ctx, args, arg, "lto-pseudo-probe-for-profiling")) {
+      ctx.arg.plugin_opt.push_back("pseudo-probe-for-profiling=" + std::string(arg));
+    } else if (read_arg(ctx, args, arg, "lto-sample-profile")) {
+      ctx.arg.plugin_opt.push_back("sample-profile=" + std::string(arg));
+    } else if (read_flag(args, "save-temps")) {
+      ctx.arg.plugin_opt.push_back("save-temps");
+    } else if (read_flag(args, "thinlto-emit-imports-files")) {
+      ctx.arg.plugin_opt.push_back("thinlto-emit-imports-files");
+    } else if (read_arg(ctx, args, arg, "thinlto-index-only")) {
+      ctx.arg.plugin_opt.push_back("thinlto-index-only=" + std::string(arg));
+    } else if (read_flag(args, "thinlto-index-only")) {
+      ctx.arg.plugin_opt.push_back("thinlto-index-only");
+    } else if (read_arg(ctx, args, arg, "thinlto-object-suffix-replace")) {
+      ctx.arg.plugin_opt.push_back("thinlto-object-suffix-replace=" + std::string(arg));
+    } else if (read_arg(ctx, args, arg, "thinlto-prefix-replace")) {
+      ctx.arg.plugin_opt.push_back("thinlto-prefix-replace=" + std::string(arg));
+    } else if (read_arg(ctx, args, arg, "thinlto-jobs")) {
+      ctx.arg.plugin_opt.push_back("jobs=" + std::string(arg));
     } else if (read_arg(ctx, args, arg, "thread-count")) {
       ctx.arg.thread_count = parse_number(ctx, "thread-count", arg);
     } else if (read_flag(args, "threads")) {
       ctx.arg.thread_count = 0;
     } else if (read_flag(args, "no-threads")) {
       ctx.arg.thread_count = 1;
-    } else if (args[0].starts_with("-threads=")) {
-      ctx.arg.thread_count = parse_number(ctx, "threads=", args[0].substr(9));
-      args = args.subspan(1);
-    } else if (args[0].starts_with("--threads=")) {
-      ctx.arg.thread_count = parse_number(ctx, "threads=", args[0].substr(10));
-      args = args.subspan(1);
+    } else if (read_eq(ctx, args, arg, "threads")) {
+      ctx.arg.thread_count = parse_number(ctx, "threads", arg);
     } else if (read_flag(args, "discard-all") || read_flag(args, "x")) {
       ctx.arg.discard_all = true;
     } else if (read_flag(args, "discard-locals") || read_flag(args, "X")) {
@@ -897,6 +994,10 @@ void parse_nonpositional_args(Context<E> &ctx,
     }
   }
 
+  // Remove redundant `/..` or `/.` from library paths.
+  for (std::string &path : ctx.arg.library_paths)
+    path = path_clean(path);
+
   if (ctx.arg.shared) {
     ctx.arg.pic = true;
     ctx.arg.dynamic_linker = "";
@@ -921,7 +1022,7 @@ void parse_nonpositional_args(Context<E> &ctx,
   }
 
   if (ctx.arg.image_base % ctx.page_size)
-    Fatal(ctx) << "-image-base msut be a multiple of -max-page-size";
+    Fatal(ctx) << "-image-base must be a multiple of -max-page-size";
 
   if (char *env = getenv("MOLD_REPRO"); env && env[0])
     ctx.arg.repro = true;
@@ -940,6 +1041,9 @@ void parse_nonpositional_args(Context<E> &ctx,
     ctx.arg.version_definitions.push_back(ver);
     ctx.default_version = VER_NDX_LAST_RESERVED + 1;
   }
+
+  if (ctx.arg.shared && warn_shared_textrel)
+    ctx.arg.warn_textrel = true;
 
   std::tie(ctx.plt_hdr_size, ctx.plt_size) = get_plt_size(ctx);
 
@@ -968,6 +1072,7 @@ void parse_nonpositional_args(Context<E> &ctx,
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(ARM32);
 INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

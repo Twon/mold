@@ -33,22 +33,36 @@ static inline i64 to_p2align(u64 alignment) {
 
 template <typename E>
 InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
-                              std::string_view name, i64 section_idx)
-  : file(file), nameptr(name.data()), namelen(name.size()),
-    section_idx(section_idx) {
-  if (section_idx < file.elf_sections.size())
+                              std::string_view name, i64 shndx)
+  : file(file), shndx(shndx) {
+  if (shndx < file.elf_sections.size())
     contents = {(char *)file.mf->data + shdr().sh_offset, shdr().sh_size};
+
+  bool compressed;
 
   if (name.starts_with(".zdebug")) {
     sh_size = *(ubig64 *)&contents[4];
     p2align = to_p2align(shdr().sh_addralign);
+    compressed = true;
   } else if (shdr().sh_flags & SHF_COMPRESSED) {
     ElfChdr<E> &chdr = *(ElfChdr<E> *)&contents[0];
     sh_size = chdr.ch_size;
     p2align = to_p2align(chdr.ch_addralign);
+    compressed = true;
   } else {
     sh_size = shdr().sh_size;
     p2align = to_p2align(shdr().sh_addralign);
+    compressed = false;
+  }
+
+  // Uncompress early if the relocation is REL-type so that we can read
+  // addends from section contents. If RELA-type, we don't need to do this
+  // because addends are in relocations.
+  if (compressed && E::is_rel) {
+    u8 *buf = new u8[sh_size];
+    uncompress(ctx, buf);
+    contents = {(char *)buf, sh_size};
+    ctx.string_pool.emplace_back(buf);
   }
 
   output_section =
@@ -57,7 +71,8 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
 
 template <typename E>
 bool InputSection<E>::is_compressed() {
-  return name().starts_with(".zdebug") || (shdr().sh_flags & SHF_COMPRESSED);
+  return !E::is_rel &&
+         (name().starts_with(".zdebug") || (shdr().sh_flags & SHF_COMPRESSED));
 }
 
 template <typename E>
@@ -166,7 +181,6 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
     }
 
     assert(sym.is_imported);
-    needs_dynrel[i] = true;
     file.num_dynrel++;
     return;
   case BASEREL:
@@ -179,7 +193,6 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
       ctx.has_textrel = true;
     }
 
-    needs_baserel[i] = true;
     if (!is_relr_reloc(ctx, rel))
       file.num_dynrel++;
     return;
@@ -196,11 +209,10 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
   // Copy data
   if constexpr (E::e_machine == EM_RISCV) {
     copy_contents_riscv(ctx, buf);
+  } else if (is_compressed()) {
+    uncompress(ctx, buf);
   } else {
-    if (is_compressed())
-      uncompress(ctx, buf);
-    else
-      memcpy(buf, contents.data(), contents.size());
+    memcpy(buf, contents.data(), contents.size());
   }
 
   // Apply relocations
@@ -236,6 +248,7 @@ void report_undef(Context<E> &ctx, InputFile<E> &file, Symbol<E> &sym) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(ARM32);
 INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

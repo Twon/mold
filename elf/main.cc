@@ -387,6 +387,8 @@ static int elf_main(int argc, char **argv) {
       return elf_main<I386>(argc, argv);
     case EM_AARCH64:
       return elf_main<ARM64>(argc, argv);
+    case EM_ARM:
+      return elf_main<ARM32>(argc, argv);
     case EM_RISCV:
       return elf_main<RISCV64>(argc, argv);
     }
@@ -510,7 +512,6 @@ static int elf_main(int argc, char **argv) {
   // Create a dummy file containing linker-synthesized symbols
   // (e.g. `__bss_start`).
   ctx.internal_obj = create_internal_file(ctx);
-  ctx.internal_obj->resolve_symbols(ctx);
   ctx.objs.push_back(ctx.internal_obj);
 
   // Beyond this point, no new files will be added to ctx.objs
@@ -519,12 +520,6 @@ static int elf_main(int argc, char **argv) {
   // Handle `-z cet-report`.
   if (ctx.arg.z_cet_report != CET_REPORT_NONE)
     check_cet_errors(ctx);
-
-  // Handle --print-dependencies
-  if (ctx.arg.print_dependencies == 1)
-    print_dependencies(ctx);
-  else if (ctx.arg.print_dependencies == 2)
-    print_dependencies_full(ctx);
 
   // If we are linking a .so file, remaining undefined symbols does
   // not cause a linker error. Instead, they are treated as if they
@@ -555,7 +550,7 @@ static int elf_main(int argc, char **argv) {
   sort_init_fini(ctx);
 
   // Handle --shuffle-sections
-  if (ctx.arg.shuffle_sections)
+  if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_NONE)
     shuffle_sections(ctx);
 
   // Compute sizes of output sections while assigning offsets
@@ -575,10 +570,8 @@ static int elf_main(int argc, char **argv) {
     ctx.dynstr->add_string(str);
   for (std::string_view str : ctx.arg.filter)
     ctx.dynstr->add_string(str);
-  if (!ctx.arg.rpaths.empty())
-    ctx.dynstr->add_string(ctx.arg.rpaths);
-  if (!ctx.arg.soname.empty())
-    ctx.dynstr->add_string(ctx.arg.soname);
+  ctx.dynstr->add_string(ctx.arg.rpaths);
+  ctx.dynstr->add_string(ctx.arg.soname);
 
   // Scan relocations to find symbols that need entries in .got, .plt,
   // .got.plt, .dynsym, .dynstr, etc.
@@ -659,16 +652,15 @@ static int elf_main(int argc, char **argv) {
   // Fix linker-synthesized symbol addresses.
   fix_synthetic_symbols(ctx);
 
-  // If --compress-debug-sections is given, compress .debug_* sections
-  // using zlib.
-  if (ctx.arg.compress_debug_sections != COMPRESS_NONE) {
-    compress_debug_sections(ctx);
-    filesize = set_osec_offsets(ctx);
-  }
-
-  // At this point, file layout is fixed.
   // Beyond this, you can assume that symbol addresses including their
   // GOT or PLT addresses have a correct final value.
+
+  // If --compress-debug-sections is given, compress .debug_* sections
+  // using zlib.
+  if (ctx.arg.compress_debug_sections != COMPRESS_NONE)
+    filesize = compress_debug_sections(ctx);
+
+  // At this point, file layout is fixed.
 
   // Some types of TLS relocations are defined relative to the beginning
   // or the end of the TLS segment address. Find these addresses now.
@@ -693,11 +685,9 @@ static int elf_main(int argc, char **argv) {
     Timer t(ctx, "copy_buf");
 
     tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-      std::string name(chunk->name);
-      if (name.empty())
-        name = "(header)";
+      std::string name =
+        chunk->name.empty() ? "(header)" : std::string(chunk->name);
       Timer t2(ctx, name, &t);
-
       chunk->copy_buf(ctx);
     });
 
@@ -723,6 +713,16 @@ static int elf_main(int argc, char **argv) {
 
   // Close the output file. This is the end of the linker's main job.
   ctx.output_file->close(ctx);
+
+  // Handle --dependency-file
+  if (!ctx.arg.dependency_file.empty())
+    write_dependency_file(ctx);
+
+  // Handle --print-dependencies
+  if (ctx.arg.print_dependencies == 1)
+    print_dependencies(ctx);
+  else if (ctx.arg.print_dependencies == 2)
+    print_dependencies_full(ctx);
 
   if (ctx.has_lto_object)
     lto_cleanup(ctx);
@@ -763,6 +763,7 @@ int main(int argc, char **argv) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(ARM32);
 INSTANTIATE(RISCV64);
 
 } // namespace mold::elf
