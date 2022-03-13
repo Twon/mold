@@ -1,5 +1,6 @@
 target_sources(mold
     PRIVATE
+        arch-arm32.cc
         arch-arm64.cc
         arch-i386.cc
         arch-riscv64.cc

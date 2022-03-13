@@ -55,7 +55,7 @@ target_include_directories(mold
 target_sources(mold
     PRIVATE
         archive-file.h
-        byteorder.h
+        big-endian.h
         cmdline.h
         compress.cc
         demangle.cc
