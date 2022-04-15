@@ -7,3 +7,4 @@ mimalloc/2.0.3
 
 [generators]
 cmake_find_package
+virtualenv

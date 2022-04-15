@@ -52,30 +52,35 @@ or Clang 12.0.0 as well as libstdc++ 10 or libc++ 7 are recommended.
 I'm using Ubuntu 20.04 as a development platform. In that environment,
 you can build mold by the following commands.
 
-### Install dependencies
-
-#### Ubuntu 20.04 and later / Debian 11 and later
-
-```shell
-sudo apt-get update
-sudo apt-get install -y build-essential git clang cmake libstdc++-10-dev libssl-dev libxxhash-dev zlib1g-dev pkg-config
-```
-
-#### Fedora 34 and later
-
-```shell
-sudo dnf install -y git clang cmake openssl-devel xxhash-devel zlib-devel libstdc++-devel
-```
-
 ### Compile mold
 
-```shell
-git clone https://github.com/rui314/mold.git
-cd mold
-git checkout v1.1.1
-make -j$(nproc) CXX=clang++
-sudo make install
-```
+1. Clone project
+   ```
+   git clone https://github.com/profitviews/cpp_crypto_algos.git cpp_crypto_algos
+   cd mold
+   git checkout v1.1.1
+   ```
+
+2. Install Conan
+   ```
+   python3 -m venv .venv         # Create a Python virtual env
+   source ./.venv/bin/activate   # Activate the virtual env
+   pip install conan             # Install conan
+   ```
+
+3. Install Conan Package & Configure CMake 
+   ```
+   mkdir build
+   cd build
+   conan install ../ --build missing
+   source ./activate.sh
+   cmake -DCMAKE_BUILD_TYPE=Debug ..
+   ```
+   
+4. Build
+   ```bash
+   cmake --build . --parallel $(nproc)
+   ```
 
 You may need to pass a C++20 compiler command name to `make`.
 In the above case, `clang++` is passed. If it doesn't work for you,
