@@ -67,6 +67,8 @@ static constexpr u32 SHT_GNU_VERDEF = 0x6ffffffd;
 static constexpr u32 SHT_GNU_VERNEED = 0x6ffffffe;
 static constexpr u32 SHT_GNU_VERSYM = 0x6fffffff;
 static constexpr u32 SHT_X86_64_UNWIND = 0x70000001;
+static constexpr u32 SHT_ARM_EXIDX = 0x70000001;
+static constexpr u32 SHT_ARM_ATTRIBUTES = 0x70000003;
 
 static constexpr u32 SHF_WRITE = 0x1;
 static constexpr u32 SHF_ALLOC = 0x2;
@@ -122,6 +124,7 @@ static constexpr u32 PT_TLS = 7;
 static constexpr u32 PT_GNU_EH_FRAME = 0x6474e550;
 static constexpr u32 PT_GNU_STACK = 0x6474e551;
 static constexpr u32 PT_GNU_RELRO = 0x6474e552;
+static constexpr u32 PT_ARM_EXIDX = 0x70000001;
 
 static constexpr u32 PF_X = 1;
 static constexpr u32 PF_W = 2;
@@ -230,6 +233,10 @@ static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_IBT = 1;
 static constexpr u32 GNU_PROPERTY_X86_FEATURE_1_SHSTK = 2;
 
 static constexpr u32 ELFCOMPRESS_ZLIB = 1;
+
+static constexpr u32 EF_ARM_ABI_FLOAT_SOFT = 0x00000200;
+static constexpr u32 EF_ARM_ABI_FLOAT_HARD = 0x00000400;
+static constexpr u32 EF_ARM_EABI_VER5 = 0x05000000;
 
 static constexpr u32 EF_RISCV_RVC = 1;
 static constexpr u32 EF_RISCV_FLOAT_ABI = 6;
@@ -1043,6 +1050,38 @@ static constexpr u32 DW_EH_PE_datarel = 0x30;
 static constexpr u32 DW_EH_PE_funcrel = 0x40;
 static constexpr u32 DW_EH_PE_aligned = 0x50;
 
+static constexpr u32 DW_AT_low_pc = 0x11;
+static constexpr u32 DW_AT_high_pc = 0x12;
+static constexpr u32 DW_AT_producer = 0x25;
+static constexpr u32 DW_AT_ranges = 0x55;
+
+static constexpr u32 DW_TAG_compile_unit = 0x11;
+
+static constexpr u32 DW_FORM_addr = 0x01;
+static constexpr u32 DW_FORM_block2 = 0x03;
+static constexpr u32 DW_FORM_block4 = 0x04;
+static constexpr u32 DW_FORM_data2 = 0x05;
+static constexpr u32 DW_FORM_data4 = 0x06;
+static constexpr u32 DW_FORM_data8 = 0x07;
+static constexpr u32 DW_FORM_string = 0x08;
+static constexpr u32 DW_FORM_block = 0x09;
+static constexpr u32 DW_FORM_block1 = 0x0a;
+static constexpr u32 DW_FORM_data1 = 0x0b;
+static constexpr u32 DW_FORM_flag = 0x0c;
+static constexpr u32 DW_FORM_sdata = 0x0d;
+static constexpr u32 DW_FORM_strp = 0x0e;
+static constexpr u32 DW_FORM_udata = 0x0f;
+static constexpr u32 DW_FORM_ref_addr = 0x10;
+static constexpr u32 DW_FORM_ref1 = 0x11;
+static constexpr u32 DW_FORM_ref2 = 0x12;
+static constexpr u32 DW_FORM_ref4 = 0x13;
+static constexpr u32 DW_FORM_ref8 = 0x14;
+static constexpr u32 DW_FORM_ref_udata = 0x15;
+static constexpr u32 DW_FORM_indirect = 0x16;
+static constexpr u32 DW_FORM_sec_offset = 0x17;
+static constexpr u32 DW_FORM_exprloc = 0x18;
+static constexpr u32 DW_FORM_flag_present = 0x19;
+
 struct Elf64Sym {
   bool is_defined() const { return !is_undef(); }
   bool is_undef() const { return st_shndx == SHN_UNDEF; }
@@ -1278,9 +1317,9 @@ struct X86_64 {
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_X86_64;
   static constexpr u32 pltgot_size = 8;
-  static constexpr u32 tls_offset = -1;
   static constexpr bool is_rel = false;
   static constexpr bool is_le = true;
+  static constexpr bool supports_tlsdesc = true;
 };
 
 template <> struct ElfSym<X86_64> : public Elf64Sym {};
@@ -1309,10 +1348,10 @@ struct I386 {
   static constexpr u32 word_size = 4;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_386;
-  static constexpr u32 tls_offset = -1;
   static constexpr u32 pltgot_size = 8;
   static constexpr bool is_rel = true;
   static constexpr bool is_le = true;
+  static constexpr bool supports_tlsdesc = true;
 };
 
 template <> struct ElfSym<I386> : public Elf32Sym {};
@@ -1341,10 +1380,10 @@ struct ARM64 {
   static constexpr u32 word_size = 8;
   static constexpr u32 page_size = 65536;
   static constexpr u32 e_machine = EM_AARCH64;
-  static constexpr u32 tls_offset = 16;
   static constexpr u32 pltgot_size = 16;
   static constexpr bool is_rel = false;
   static constexpr bool is_le = true;
+  static constexpr bool supports_tlsdesc = true;
 };
 
 template <> struct ElfSym<ARM64> : public Elf64Sym {};
@@ -1373,10 +1412,10 @@ struct ARM32 {
   static constexpr u32 word_size = 4;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_ARM;
-  static constexpr u32 tls_offset = 0;
-  static constexpr u32 pltgot_size = 8;
+  static constexpr u32 pltgot_size = 16;
   static constexpr bool is_rel = true;
   static constexpr bool is_le = true;
+  static constexpr bool supports_tlsdesc = true;
 };
 
 template <> struct ElfSym<ARM32> : public Elf32Sym {};
@@ -1405,9 +1444,9 @@ struct RISCV64 {
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_RISCV;
   static constexpr u32 pltgot_size = 16;
-  static constexpr u32 tls_offset = 0;
   static constexpr bool is_rel = false;
   static constexpr bool is_le = true;
+  static constexpr bool supports_tlsdesc = false;
 };
 
 template <> struct ElfSym<RISCV64> : public Elf64Sym {};

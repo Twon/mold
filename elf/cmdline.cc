@@ -49,6 +49,9 @@ Options:
   --Bsymbolic-functions       Bind global functions locally
   --Bno-symbolic              Cancel --Bsymbolic and --Bsymbolic-functions
   --Map FILE                  Write map file to a given file
+  --Tbss=ADDR                 Set address to .bss
+  --Tdata                     Set address to .data
+  --Ttext                     Set address to .text
   --allow-multiple-definition Allow multiple definitions
   --as-needed                 Only set DT_NEEDED if used
     --no-as-needed
@@ -66,7 +69,8 @@ Options:
   --defsym=SYMBOL=VALUE       Define a symbol alias
   --demangle                  Demangle C++ symbols in log messages (default)
     --no-demangle
-  --disable-new-dtags         Ignored
+  --enable-new-dtags          Emit DT_RUNPATH for --rpath (default)
+    --disable-new-dtags       Emit DT_RPATH for --rpath
   --dp                        Ignored
   --dynamic-list              Read a list of dynamic symbols
   --eh-frame-hdr              Create .eh_frame_hdr section
@@ -80,15 +84,16 @@ Options:
     --no-fork
   --gc-sections               Remove unreferenced sections
     --no-gc-sections
-  --gdb-index                 Ignored
+  --gdb-index                 Create .gdb_index for faster gdb startup
   --hash-style [sysv,gnu,both]
                               Set hash style
-  --icf                       Fold identical code
+  --icf=[all,none]            Fold identical code
     --no-icf
   --image-base ADDR           Set the base address to a given value
   --init SYMBOL               Call SYMBOl at load-time
   --no-undefined              Report undefined symbols (even with --shared)
   --noinhibit-exec            Create an output file even if errors occur
+  --oformat=binary            Omit ELF, section and program headers
   --pack-dyn-relocs=[relr,none]
                               Pack dynamic relocations
   --perf                      Print performance statistics
@@ -113,6 +118,7 @@ Options:
   --rpath DIR                 Add DIR to runtime search path
   --rpath-link DIR            Ignored
   --run COMMAND ARG...        Run COMMAND with mold as /usr/bin/ld
+  --section-start=SECTION=ADDR Set address to section
   --shared, --Bshareable      Create a share library
   --shuffle-sections[=SEED]   Randomize the output by shuffling input sections
   --sort-common               Ignored
@@ -279,19 +285,26 @@ bool read_z_arg(Context<E> &ctx, std::span<std::string_view> &args,
 
 template <typename E>
 static i64 parse_hex(Context<E> &ctx, std::string opt, std::string_view value) {
-  if (!value.starts_with("0x") && !value.starts_with("0X"))
-    Fatal(ctx) << "option -" << opt << ": not a hexadecimal number";
-  value = value.substr(2);
+  if (value.starts_with("0x") || value.starts_with("0X"))
+    value = value.substr(2);
   if (value.find_first_not_of("0123456789abcdefABCDEF") != value.npos)
     Fatal(ctx) << "option -" << opt << ": not a hexadecimal number";
-  return std::stol(std::string(value), nullptr, 16);
+  return std::stoul(std::string(value), nullptr, 16);
 }
 
 template <typename E>
 static i64 parse_number(Context<E> &ctx, std::string opt,
                         std::string_view value) {
   size_t nread;
-  i64 ret = std::stol(std::string(value), &nread, 0);
+
+  if (value.starts_with('-')) {
+    i64 ret = std::stoul(std::string(value.substr(1)), &nread, 0);
+    if (value.size() - 1 != nread)
+      Fatal(ctx) << "option -" << opt << ": not a number: " << value;
+    return -ret;
+  }
+
+  i64 ret = std::stoul(std::string(value), &nread, 0);
   if (value.size() != nread)
     Fatal(ctx) << "option -" << opt << ": not a number: " << value;
   return ret;
@@ -403,22 +416,22 @@ parse_defsym_value(Context<E> &ctx, std::string_view s) {
 // Returns a PLT header size and a PLT entry size.
 template <typename E>
 static std::pair<i64, i64> get_plt_size(Context<E> &ctx) {
-  switch (E::e_machine) {
-  case EM_X86_64:
+  if constexpr (std::is_same_v<E, X86_64>) {
     if (ctx.arg.z_now)
       return {0, 8};
     if (ctx.arg.z_ibtplt)
       return {32, 16};
     return {16, 16};
-  case EM_386:
-    return {16, 16};
-  case EM_AARCH64:
-    return {32, 16};
-  case EM_ARM:
-    return {16, 16};
-  case EM_RISCV:
-    return {32, 16};
   }
+
+  if constexpr (std::is_same_v<E, I386>)
+    return {16, 16};
+  if constexpr (std::is_same_v<E, ARM64>)
+    return {32, 16};
+  if constexpr (std::is_same_v<E, ARM32>)
+    return {20, 16};
+  if constexpr (std::is_same_v<E, RISCV64>)
+    return {32, 16};
   unreachable();
 }
 
@@ -436,7 +449,7 @@ void parse_nonpositional_args(Context<E> &ctx,
 
   // RISC-V object files contains lots of local symbols, so by default
   // we discard them. This is compatible with GNU ld.
-  if (E::e_machine == EM_RISCV)
+  if constexpr (std::is_same_v<E, RISCV64>)
     ctx.arg.discard_locals = true;
 
   while (!args.empty()) {
@@ -613,6 +626,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.relax = true;
     } else if (read_flag(args, "no-relax")) {
       ctx.arg.relax = false;
+    } else if (read_flag(args, "gdb-index")) {
+      ctx.arg.gdb_index = true;
+    } else if (read_flag(args, "no-gdb-index")) {
+      ctx.arg.gdb_index = false;
     } else if (read_flag(args, "r") || read_flag(args, "relocatable")) {
       ctx.arg.relocatable = true;
     } else if (read_flag(args, "perf")) {
@@ -653,6 +670,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       warn_shared_textrel = true;
     } else if (read_flag(args, "warn-textrel")) {
       ctx.arg.warn_textrel = true;
+    } else if (read_flag(args, "enable-new-dtags")) {
+      ctx.arg.enable_new_dtags = true;
+    } else if (read_flag(args, "disable-new-dtags")) {
+      ctx.arg.enable_new_dtags = false;
     } else if (read_arg(ctx, args, arg, "compress-debug-sections")) {
       if (arg == "zlib" || arg == "zlib-gabi")
         ctx.arg.compress_debug_sections = COMPRESS_GABI;
@@ -669,8 +690,24 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.is_static = true;
     } else if (read_flag(args, "no-omagic")) {
       ctx.arg.omagic = false;
+    } else if (read_arg(ctx, args, arg, "oformat")) {
+      if (arg != "binary")
+        Fatal(ctx) << "-oformat: " << arg << " is not supported";
+      ctx.arg.oformat_binary = true;
     } else if (read_arg(ctx, args, arg, "retain-symbols-file")) {
       read_retain_symbols_file(ctx, arg);
+    } else if (read_arg(ctx, args, arg, "section-start")) {
+      size_t pos = arg.find('=');
+      if (pos == arg.npos || pos == arg.size() - 1)
+        Fatal(ctx) << "-section-start: syntax error: " << arg;
+      ctx.arg.section_start[arg.substr(0, pos)] =
+        parse_hex(ctx, "section-start", arg.substr(pos + 1));
+    } else if (read_arg(ctx, args, arg, "Tbss")) {
+      ctx.arg.section_start[".bss"] = parse_hex(ctx, "Tbss", arg);
+    } else if (read_arg(ctx, args, arg, "Tdata")) {
+      ctx.arg.section_start[".data"] = parse_hex(ctx, "Tdata", arg);
+    } else if (read_arg(ctx, args, arg, "Ttext")) {
+      ctx.arg.section_start[".text"] = parse_hex(ctx, "Ttext", arg);
     } else if (read_flag(args, "repro")) {
       ctx.arg.repro = true;
     } else if (read_z_flag(args, "now")) {
@@ -905,6 +942,8 @@ void parse_nonpositional_args(Context<E> &ctx,
                read_arg(ctx, args, arg, "F")) {
       ctx.arg.filter.push_back(arg);
     } else if (read_flag(args, "preload")) {
+      Warn(ctx) << "--preload is deprecated and will be removed in a"
+                << " future version";
       ctx.arg.preload = true;
     } else if (read_flag(args, "no-preload")) {
       ctx.arg.preload = false;
@@ -915,7 +954,6 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_flag(args, "O2")) {
     } else if (read_flag(args, "verbose")) {
     } else if (read_flag(args, "color-diagnostics")) {
-    } else if (read_flag(args, "gdb-index")) {
     } else if (read_flag(args, "eh-frame-hdr")) {
     } else if (read_flag(args, "start-group")) {
     } else if (read_flag(args, "end-group")) {
@@ -998,10 +1036,8 @@ void parse_nonpositional_args(Context<E> &ctx,
   for (std::string &path : ctx.arg.library_paths)
     path = path_clean(path);
 
-  if (ctx.arg.shared) {
+  if (ctx.arg.shared)
     ctx.arg.pic = true;
-    ctx.arg.dynamic_linker = "";
-  }
 
   if (ctx.arg.pic)
     ctx.arg.image_base = 0;

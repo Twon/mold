@@ -37,9 +37,12 @@ void create_synthetic_sections(Context<E> &ctx) {
     return std::unique_ptr<T>(x);
   };
 
-  ctx.ehdr = push(new OutputEhdr<E>);
-  ctx.phdr = push(new OutputPhdr<E>);
-  ctx.shdr = push(new OutputShdr<E>);
+  if (!ctx.arg.oformat_binary) {
+    ctx.ehdr = push(new OutputEhdr<E>);
+    ctx.phdr = push(new OutputPhdr<E>);
+    ctx.shdr = push(new OutputShdr<E>);
+  }
+
   ctx.got = push(new GotSection<E>);
   ctx.gotplt = push(new GotPltSection<E>);
   ctx.reldyn = push(new RelDynSection<E>);
@@ -65,6 +68,8 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.buildid = push(new BuildIdSection<E>);
   if (ctx.arg.eh_frame_hdr)
     ctx.eh_frame_hdr = push(new EhFrameHdrSection<E>);
+  if (ctx.arg.gdb_index)
+    ctx.gdb_index = push(new GdbIndexSection<E>);
   if (ctx.arg.hash_style_sysv)
     ctx.hash = push(new HashSection<E>);
   if (ctx.arg.hash_style_gnu)
@@ -72,10 +77,24 @@ void create_synthetic_sections(Context<E> &ctx) {
   if (!ctx.arg.version_definitions.empty())
     ctx.verdef = push(new VerdefSection<E>);
 
-  ctx.dynamic = push(new DynamicSection<E>);
+  if (ctx.arg.shared || !ctx.dsos.empty() || ctx.arg.pie)
+    ctx.dynamic = push(new DynamicSection<E>);
+
   ctx.versym = push(new VersymSection<E>);
   ctx.verneed = push(new VerneedSection<E>);
   ctx.note_property = push(new NotePropertySection<E>);
+
+  if constexpr (std::is_same_v<E, ARM32>) {
+    ctx.thumb_to_arm = push(new ThumbToArmSection);
+    ctx.tls_trampoline = push(new TlsTrampolineSection);
+  }
+
+  // If .dynamic exists, .dynsym and .dynstr must exist as well
+  // since .dynamic refers them.
+  if (ctx.dynamic) {
+    ctx.dynstr->keep();
+    ctx.dynsym->keep();
+  }
 }
 
 template <typename E>
@@ -345,9 +364,9 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
   obj->features = -1;
   obj->priority = 1;
 
-  auto add = [&](std::string_view name) {
+  auto add = [&](std::string_view name, u8 st_type = STT_NOTYPE) {
     ElfSym<E> esym = {};
-    esym.st_type = STT_NOTYPE;
+    esym.st_type = st_type;
     esym.st_shndx = SHN_ABS;
     esym.st_bind = STB_GLOBAL;
     esym.st_visibility = STV_HIDDEN;
@@ -388,8 +407,17 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
   if (!get_symbol(ctx, "edata")->file)
     ctx.edata = add("edata");
 
-  if (E::e_machine == EM_RISCV && !ctx.arg.shared)
-    ctx.__global_pointer = add("__global_pointer$");
+  if constexpr (E::supports_tlsdesc)
+    ctx._TLS_MODULE_BASE_ = add("_TLS_MODULE_BASE_");
+
+  if constexpr (std::is_same_v<E, RISCV64>)
+    if (!ctx.arg.shared)
+      ctx.__global_pointer = add("__global_pointer$");
+
+  if constexpr (std::is_same_v<E, ARM32>) {
+    ctx.__exidx_start = add("__exidx_start");
+    ctx.__exidx_end = add("__exidx_end");
+  }
 
   for (Chunk<E> *chunk : ctx.chunks) {
     if (!is_c_identifier(chunk->name))
@@ -624,7 +652,7 @@ void sort_init_fini(Context<E> &ctx) {
   Timer t(ctx, "sort_init_fini");
 
   auto get_priority = [](InputSection<E> *isec) {
-    static std::regex re(R"(_array\.(\d+)$)", std::regex_constants::optimize);
+    static std::regex re(R"(\.(\d+)$)", std::regex_constants::optimize);
     std::string name = isec->name().begin();
     std::smatch m;
     if (std::regex_search(name, m, re))
@@ -635,6 +663,43 @@ void sort_init_fini(Context<E> &ctx) {
   for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections) {
     if (osec->name == ".init_array" || osec->name == ".fini_array") {
       if (ctx.arg.shuffle_sections == SHUFFLE_SECTIONS_REVERSE)
+        std::reverse(osec->members.begin(), osec->members.end());
+
+      sort(osec->members, [&](InputSection<E> *a, InputSection<E> *b) {
+        return get_priority(a) < get_priority(b);
+      });
+    }
+  }
+}
+
+template <typename E>
+void sort_ctor_dtor(Context<E> &ctx) {
+  Timer t(ctx, "sort_ctor_dtor");
+
+  auto get_priority = [](InputSection<E> *isec) {
+    auto opts = std::regex_constants::optimize | std::regex_constants::ECMAScript;
+    static std::regex re1(R"((?:clang_rt\.)?crtbegin)", opts);
+    static std::regex re2(R"((?:clang_rt\.)?crtend)", opts);
+    static std::regex re3(R"(\.(\d+)$)", opts);
+
+    // crtbegin.o and crtend.o contain marker symbols such as
+    // __CTOR_LIST__ or __DTOR_LIST__. So they have to be at the
+    // beginning or end of the section.
+    std::smatch m;
+    if (std::regex_search(isec->file.filename, m, re1))
+      return -2;
+    if (std::regex_search(isec->file.filename, m, re2))
+      return 65536;
+
+    std::string name(isec->name());
+    if (std::regex_search(name, m, re3))
+      return std::stoi(m[1]);
+    return -1;
+  };
+
+  for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections) {
+    if (osec->name == ".ctors" || osec->name == ".dtors") {
+      if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_REVERSE)
         std::reverse(osec->members.begin(), osec->members.end());
 
       sort(osec->members, [&](InputSection<E> *a, InputSection<E> *b) {
@@ -676,7 +741,8 @@ void shuffle_sections(Context<E> &ctx) {
 
   auto is_eligible = [](OutputSection<E> &osec) {
     return osec.name != ".init" && osec.name != ".fini" &&
-           osec.name != ".init_array" && osec.name != ".fini_array";
+           osec.name != ".init_array" && osec.name != ".fini_array" &&
+           osec.name != ".ctors" && osec.name != ".dtors";
   };
 
   switch (ctx.arg.shuffle_sections) {
@@ -837,20 +903,19 @@ void scan_rels(Context<E> &ctx) {
       ctx.got->add_got_symbol(ctx, sym);
 
     if (sym->flags & NEEDS_PLT) {
-      bool is_canonical = (!ctx.arg.pic && sym->is_imported);
-
-      // If a symbol needs a canonical PLT, it is considered both
-      // imported and exported.
-      if (is_canonical)
+      if (sym->is_canonical) {
+        // A canonical PLT needs to be visible from DSOs.
         sym->is_exported = true;
 
-      if ((sym->flags & NEEDS_GOT) && !is_canonical) {
-        ctx.pltgot->add_symbol(ctx, sym);
-      } else{
-        // If we need to create a canonical PLT, we can't use .plt.got
-        // because otherwise .plt.got and .got would refer each other,
-        // resulting in an infinite loop at runtime.
+        // We can't use .plt.got for a canonical PLT because otherwise
+        // .plt.got and .got would refer each other, resulting in an
+        // infinite loop at runtime.
         ctx.plt->add_symbol(ctx, sym);
+      } else {
+        if (sym->flags & NEEDS_GOT)
+          ctx.pltgot->add_symbol(ctx, sym);
+        else
+          ctx.plt->add_symbol(ctx, sym);
       }
     }
 
@@ -890,6 +955,10 @@ void scan_rels(Context<E> &ctx) {
         ctx.dynsym->add_symbol(ctx, alias);
       }
     }
+
+    if constexpr (std::is_same_v<E, ARM32>)
+      if (sym->flags & NEEDS_THUMB_TO_ARM_THUNK)
+        ctx.thumb_to_arm->add_symbol(ctx, sym);
 
     sym->flags = 0;
   }
@@ -1076,11 +1145,13 @@ void compute_import_export(Context<E> &ctx) {
         continue;
 
       if (sym->file != file && sym->file->is_dso) {
+        std::scoped_lock lock(sym->mu);
         sym->is_imported = true;
         continue;
       }
 
       if (sym->file == file) {
+        std::scoped_lock lock(sym->mu);
         sym->is_exported = true;
 
         if (ctx.arg.shared && sym->visibility != STV_PROTECTED &&
@@ -1118,8 +1189,16 @@ void clear_padding(Context<E> &ctx) {
 //   program header
 //   .interp
 //   alloc note
-//   alloc readonly data
+//   .hash
+//   .gnu.hash
+//   .dynsym
+//   .dynstr
+//   .gnu.version
+//   .gnu.version_r
+//   .rela.dyn
+//   .rela.plt
 //   alloc readonly code
+//   alloc readonly data
 //   alloc writable tdata
 //   alloc writable tbss
 //   alloc writable RELRO data
@@ -1129,7 +1208,18 @@ void clear_padding(Context<E> &ctx) {
 //   nonalloc
 //   section header
 //
-// .note sections are sorted by their alignments.
+// The reason to place .interp and other sections at the beginning of
+// a file is because they are needed by the loader. Especially on a
+// hard drive with spinnning disks, it is important to read these
+// sections in a single seek.
+//
+// .note sections are also placed at the beginning so that they are
+// included in a core crash dump even if it's truncated by ulimit.  In
+// particular, if .note.gnu.build-id is in a truncated core file, you
+// can at least identify which executable has crashed.
+//
+// Other file layouts are possible, but this layout is chosen to keep
+// the number of segments as few as possible.
 template <typename E>
 i64 get_section_rank(Context<E> &ctx, Chunk<E> *chunk) {
   u64 type = chunk->shdr.sh_type;
@@ -1141,8 +1231,27 @@ i64 get_section_rank(Context<E> &ctx, Chunk<E> *chunk) {
     return 1;
   if (chunk == ctx.interp.get())
     return 2;
+
   if (type == SHT_NOTE && (flags & SHF_ALLOC))
     return (1 << 10) + chunk->shdr.sh_addralign;
+
+  if (chunk == ctx.hash.get())
+    return (1 << 11) + 0;
+  if (chunk == ctx.gnu_hash.get())
+    return (1 << 11) + 1;
+  if (chunk == ctx.dynsym.get())
+    return (1 << 11) + 2;
+  if (chunk == ctx.dynstr.get())
+    return (1 << 11) + 3;
+  if (chunk == ctx.versym.get())
+    return (1 << 11) + 4;
+  if (chunk == ctx.verneed.get())
+    return (1 << 11) + 5;
+  if (chunk == ctx.reldyn.get())
+    return (1 << 11) + 6;
+  if (chunk == ctx.relplt.get())
+    return (1 << 11) + 7;
+
   if (chunk == ctx.shdr.get())
     return 1 << 30;
   if (!(flags & SHF_ALLOC))
@@ -1154,7 +1263,7 @@ i64 get_section_rank(Context<E> &ctx, Chunk<E> *chunk) {
   bool relro = is_relro(ctx, chunk);
   bool is_bss = (type == SHT_NOBITS);
 
-  return (1 << 20) | (writable << 19) | (exec << 18) | (!tls << 17) |
+  return (1 << 20) | (writable << 19) | (!exec << 18) | (!tls << 17) |
          (!relro << 16) | (is_bss << 15);
 }
 
@@ -1174,9 +1283,7 @@ static bool is_tbss(Chunk<E> *chunk) {
 
 // Assign virtual addresses and file offsets to output sections.
 template <typename E>
-i64 set_osec_offsets(Context<E> &ctx) {
-  Timer t(ctx, "set_osec_offsets");
-
+i64 do_set_osec_offsets(Context<E> &ctx) {
   std::vector<Chunk<E> *> &chunks = ctx.chunks;
 
   // Assign virtual addresses
@@ -1184,6 +1291,10 @@ i64 set_osec_offsets(Context<E> &ctx) {
   for (i64 i = 0; i < chunks.size(); i++) {
     if (!(chunks[i]->shdr.sh_flags & SHF_ALLOC))
       continue;
+
+    if (auto it = ctx.arg.section_start.find(chunks[i]->name);
+        it != ctx.arg.section_start.end())
+      addr = it->second;
 
     if (i > 0 && separate_page(ctx, chunks[i - 1], chunks[i]))
       addr = align_to(addr, ctx.page_size);
@@ -1233,6 +1344,26 @@ i64 set_osec_offsets(Context<E> &ctx) {
   return fileoff;
 }
 
+// Assign virtual addresses and file offsets to output sections.
+template <typename E>
+i64 set_osec_offsets(Context<E> &ctx) {
+  Timer t(ctx, "set_osec_offsets");
+
+  for (;;) {
+    i64 fileoff = do_set_osec_offsets(ctx);
+
+    // Assigning new offsets may change the contents and the length
+    // of the program header, so repeat it until converge.
+    if (!ctx.phdr)
+      return fileoff;
+
+    i64 sz = ctx.phdr->shdr.sh_size;
+    ctx.phdr->update_shdr(ctx);
+    if (sz == ctx.phdr->shdr.sh_size)
+      return fileoff;
+  }
+}
+
 template <typename E>
 static i64 get_num_irelative_relocs(Context<E> &ctx) {
   return std::count_if(
@@ -1256,23 +1387,27 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     }
   };
 
+  auto find = [&](std::string name) -> Chunk<E> * {
+    for (Chunk<E> *chunk : ctx.chunks)
+      if (chunk->name == name)
+        return chunk;
+    return nullptr;
+  };
+
   // __bss_start
-  for (Chunk<E> *chunk : ctx.chunks) {
-    if (chunk->is_output_section() && chunk->name == ".bss") {
-      start(ctx.__bss_start, chunk);
-      break;
-    }
-  }
+  if (Chunk<E> *chunk = find(".bss"))
+    start(ctx.__bss_start, chunk);
 
   // __ehdr_start and __executable_start
-  for (Chunk<E> *chunk : ctx.chunks) {
-    if (chunk->shndx == 1) {
-      ctx.__ehdr_start->shndx = -1;
-      ctx.__ehdr_start->value = ctx.ehdr->shdr.sh_addr;
-
-      ctx.__executable_start->shndx = -1;
-      ctx.__executable_start->value = ctx.ehdr->shdr.sh_addr;
-      break;
+  if (ctx.ehdr) {
+    for (Chunk<E> *chunk : ctx.chunks) {
+      if (chunk->shndx == 1) {
+        ctx.__ehdr_start->shndx = -1;
+        ctx.__ehdr_start->value = ctx.ehdr->shdr.sh_addr;
+        ctx.__executable_start->shndx = -1;
+        ctx.__executable_start->value = ctx.ehdr->shdr.sh_addr;
+        break;
+      }
     }
   }
 
@@ -1334,21 +1469,54 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   start(ctx._DYNAMIC, ctx.dynamic);
 
   // _GLOBAL_OFFSET_TABLE_
-  start(ctx._GLOBAL_OFFSET_TABLE_, ctx.got);
+  if constexpr (std::is_same_v<E, X86_64> || std::is_same_v<E, I386>)
+    start(ctx._GLOBAL_OFFSET_TABLE_, ctx.gotplt);
+  else
+    start(ctx._GLOBAL_OFFSET_TABLE_, ctx.got);
+
+  // _TLS_MODULE_BASE_
+  if constexpr (E::supports_tlsdesc) {
+    // _TLS_MODULE_BASE_ is used for Local Dynamic model for TLSDESC.
+    // I believe GCC and Clang don't create a reference to it, but Intel
+    // compiler seems to be using this symbol.
+    //
+    // The symbol is usually resolved to the beginning of the TLS section.
+    // But if DTPOFF is relaxed, it must point the end of the TLS section
+    // so that a GOTPC_TLSDESC's relaxed value is consistent with a
+    // DTPOFF's relaxed value.
+    u64 addr;
+    if constexpr (std::is_same_v<E, X86_64> || std::is_same_v<E, I386>) {
+      if (ctx.arg.relax && !ctx.arg.shared)
+        addr = ctx.tls_end;
+      else
+        addr = ctx.tls_begin;
+    } else {
+      addr = ctx.tls_begin;
+    }
+
+    ctx._TLS_MODULE_BASE_->shndx = -1;
+    ctx._TLS_MODULE_BASE_->value = addr;
+  }
 
   // __GNU_EH_FRAME_HDR
   start(ctx.__GNU_EH_FRAME_HDR, ctx.eh_frame_hdr);
 
   // RISC-V's __global_pointer$
-  if (E::e_machine == EM_RISCV && !ctx.arg.shared) {
-    ctx.__global_pointer->shndx = 1;
-    ctx.__global_pointer->value = 0x800;
-
-    for (Chunk<E> *chunk : ctx.chunks) {
-      if (chunk->name == ".sdata") {
+  if constexpr (std::is_same_v<E, RISCV64>) {
+    if (!ctx.arg.shared) {
+      if (Chunk<E> *chunk = find(".sdata"))
         ctx.__global_pointer->shndx = -chunk->shndx;
-        break;
-      }
+      else
+        ctx.__global_pointer->shndx = -1;
+      ctx.__global_pointer->value = 0x800;
+    }
+  }
+
+  // ARM32's __exidx_{start,end}
+  if constexpr (std::is_same_v<E, ARM32>) {
+    if (Chunk<E> *chunk = find(".ARM.exidx")) {
+      start(ctx.__exidx_start, chunk);
+      stop(ctx.__exidx_end, chunk);
     }
   }
 
@@ -1414,8 +1582,12 @@ i64 compress_debug_sections(Context<E> &ctx) {
   });
 
   ctx.shstrtab->update_shdr(ctx);
-  ctx.ehdr->update_shdr(ctx);
-  ctx.shdr->update_shdr(ctx);
+
+  if (ctx.ehdr)
+    ctx.ehdr->update_shdr(ctx);
+  if (ctx.shdr)
+    ctx.shdr->update_shdr(ctx);
+
   return set_osec_offsets(ctx);
 }
 
@@ -1463,6 +1635,7 @@ void write_dependency_file(Context<E> &ctx) {
   template void write_repro_file(Context<E> &);                         \
   template void check_duplicate_symbols(Context<E> &);                  \
   template void sort_init_fini(Context<E> &);                           \
+  template void sort_ctor_dtor(Context<E> &);                           \
   template void shuffle_sections(Context<E> &);                         \
   template std::vector<Chunk<E> *> collect_output_sections(Context<E> &); \
   template void compute_section_sizes(Context<E> &);                    \

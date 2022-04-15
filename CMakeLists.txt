@@ -32,8 +32,10 @@ if (Git_FOUND AND GITDIR)
         COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
         OUTPUT_VARIABLE GIT_HEAD_SHA1
     )
+    string(STRIP ${GIT_HEAD_SHA1} GIT_HEAD_SHA1) # Remove newline character
+    message(STATUS "Git found.  GIT_HEAD_SHA1 is set to ${GIT_HEAD_SHA1}")
 else()
-    message(STATUS "Git not found.  GIT_HASH is not set")
+    message(STATUS "Git not found.  GIT_HEAD_SHA1 is not set")
 endif()
 
 add_executable(mold "")
@@ -78,9 +80,9 @@ target_compile_features(mold
 
 target_compile_definitions(mold
     PRIVATE
-        MOLD_VERSION="${MOLD_VERSION}"
+        MOLD_VERSION=\"${MOLD_VERSION}\"
+        GIT_HASH=\"${GIT_HEAD_SHA1}\"
         $<$<BOOL:${USE_MIMALLOC}>:USE_SYSTEM_MIMALLOC>
-        -DGIT_HASH=${GIT_HEAD_SHA1}
 )
 
 target_compile_options(mold

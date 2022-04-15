@@ -49,6 +49,7 @@ ElfShdr<E> *InputFile<E>::find_section(i64 type) {
 template <typename E>
 void InputFile<E>::clear_symbols() {
   for (Symbol<E> *sym : get_global_syms()) {
+    std::scoped_lock lock(sym->mu);
     if (sym->file == this) {
       sym->file = nullptr;
       sym->shndx = 0;
@@ -156,10 +157,25 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
     case SHT_REL:
     case SHT_RELA:
     case SHT_NULL:
+    case SHT_ARM_ATTRIBUTES:
       break;
     default: {
       std::string_view name = this->shstrtab.data() + shdr.sh_name;
-      if (name == ".note.GNU-stack" || name.starts_with(".gnu.warning."))
+
+      // .note.GNU-stack section controls executable-ness of the stack
+      // area in GNU linkers. We ignore that section because silently
+      // making the stack area executable is too dangerous. Tell our
+      // users about the difference if that matters.
+      if (name == ".note.GNU-stack") {
+        if (shdr.sh_flags & SHF_EXECINSTR)
+          Warn(ctx) << *this << ": this file may cause a segmentation"
+            " fault because it requires an executable stack. See"
+            " https://github.com/rui314/mold/tree/main/docs/execstack.md"
+            " for more info.";
+        continue;
+      }
+
+      if (name.starts_with(".gnu.warning."))
         continue;
 
       if (name == ".note.gnu.property") {
@@ -176,11 +192,37 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       if (name == ".gnu.linkonce.d.DW.ref.__gxx_personality_v0")
         continue;
 
+      // Ignore debug sections if --strip-all or --strip-debug is given.
       if ((ctx.arg.strip_all || ctx.arg.strip_debug) &&
           is_debug_section(shdr, name))
         continue;
 
       this->sections[i] = std::make_unique<InputSection<E>>(ctx, *this, name, i);
+
+      // Save debug sections for --gdb-index.
+      if (ctx.arg.gdb_index) {
+        InputSection<E> *isec = this->sections[i].get();
+
+        if (name == ".debug_info")
+          debug_info = isec;
+        if (name == ".debug_abbrev")
+          debug_abbrev = isec;
+        if (name == ".debug_ranges")
+          debug_ranges = isec;
+
+        // If --gdb-index is given, contents of .debug_gnu_pubnames and
+        // .debug_gnu_pubtypes are copied to .gdb_index, so keeping them
+        // in an output file is just a waste of space.
+        if (name == ".debug_gnu_pubnames") {
+          debug_pubnames = isec;
+          isec->is_alive = false;
+        }
+
+        if (name == ".debug_gnu_pubtypes") {
+          debug_pubtypes = isec;
+          isec->is_alive = false;
+        }
+      }
 
       static Counter counter("regular_sections");
       counter++;
@@ -212,7 +254,6 @@ void ObjectFile<E>::initialize_ehframe_sections(Context<E> &ctx) {
     std::unique_ptr<InputSection<E>> &isec = sections[i];
     if (isec && isec->is_alive && isec->name() == ".eh_frame") {
       read_ehframe(ctx, *isec);
-      isec->is_ehframe = true;
       isec->is_alive = false;
     }
   }
@@ -423,7 +464,7 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
 // We expect them to be sorted, so sort them if necessary.
 template <typename E>
 void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
-  if (E::e_machine != EM_RISCV)
+  if (!std::is_same_v<E, RISCV64>)
     return;
 
   auto less = [&](const ElfRel<E> &a, const ElfRel<E> &b) {
@@ -753,6 +794,11 @@ static u64 get_rank(const Symbol<E> &sym) {
   return get_rank(sym.file, sym.esym(), !sym.file->is_alive);
 }
 
+// Symbol's visibility is set to the most restrictive one. For example,
+// if one input file has a defined symbol `foo` with the default
+// visibility and the other input file has an undefined symbol `foo`
+// with the hidden visibility, the resulting symbol is a hidden defined
+// symbol.
 template <typename E>
 void ObjectFile<E>::merge_visibility(Context<E> &ctx, Symbol<E> &sym,
                                      u8 visibility) {
@@ -994,6 +1040,24 @@ void ObjectFile<E>::scan_relocations(Context<E> &ctx) {
   }
 }
 
+// Common symbols are used by C's tantative definitions. Tentative
+// definition is an obscure C feature which allows users to omit `extern`
+// from global variable declarations in a header file. For example, if you
+// have a tentative definition `int foo;` in a header which is included
+// into multiple translation units, `foo` will be included into multiple
+// object files, but it won't cause the duplicate symbol error. Instead,
+// the linker will merge them into a single instance of `foo`.
+//
+// If a header file contains a tentative definition `int foo;` and one of
+// a C file contains a definition with initial value such as `int foo = 5;`,
+// then the "real" definition wins. The symbol for the tentative definition
+// will be resolved to the real definition. If there is no "real"
+// definition, the tentative definition gets the default initial value 0.
+//
+// Tentative definitions are represented as "common symbols" in an object
+// file. In this function, we allocate spaces in .bss for remaining common
+// symbols that were not resolved to usual defined symbols in previous
+// passes.
 template <typename E>
 void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
   if (!has_common_symbol)
@@ -1008,6 +1072,8 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *this->symbols[i];
+    std::scoped_lock lock(sym.mu);
+
     if (sym.file != this) {
       if (ctx.arg.warn_common)
         Warn(ctx) << *this << ": multiple common symbols: " << sym;

@@ -342,7 +342,7 @@ static void show_stats(Context<E> &ctx) {
   static Counter num_objs("num_objs", ctx.objs.size());
   static Counter num_dsos("num_dsos", ctx.dsos.size());
 
-  if constexpr (E::e_machine == EM_AARCH64) {
+  if constexpr (std::is_same_v<E, ARM64>) {
     static Counter num_thunks("num_thunks");
     for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
       for (std::unique_ptr<RangeExtensionThunk<E>> &thunk : osec->thunks)
@@ -466,10 +466,6 @@ static int elf_main(int argc, char **argv) {
   // Apply -exclude-libs
   apply_exclude_libs(ctx);
 
-  // Create instances of linker-synthesized sections such as
-  // .got or .plt.
-  create_synthetic_sections(ctx);
-
   // Resolve symbols and fix the set of object files that are
   // included to the final output.
   resolve_symbols(ctx);
@@ -502,6 +498,10 @@ static int elf_main(int argc, char **argv) {
 
   // Compute sizes of sections containing mergeable strings.
   compute_merged_section_sizes(ctx);
+
+  // Create instances of linker-synthesized sections such as
+  // .got or .plt.
+  create_synthetic_sections(ctx);
 
   // Bin input sections into output sections.
   bin_sections(ctx);
@@ -549,6 +549,10 @@ static int elf_main(int argc, char **argv) {
   // a special rule. Sort them.
   sort_init_fini(ctx);
 
+  // Likewise, .ctors and .dtors have to be sorted. They are rare
+  // because they are superceded by .init_array/.fini_array, though.
+  sort_ctor_dtor(ctx);
+
   // Handle --shuffle-sections
   if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_NONE)
     shuffle_sections(ctx);
@@ -570,8 +574,10 @@ static int elf_main(int argc, char **argv) {
     ctx.dynstr->add_string(str);
   for (std::string_view str : ctx.arg.filter)
     ctx.dynstr->add_string(str);
-  ctx.dynstr->add_string(ctx.arg.rpaths);
-  ctx.dynstr->add_string(ctx.arg.soname);
+  if (!ctx.arg.rpaths.empty())
+    ctx.dynstr->add_string(ctx.arg.rpaths);
+  if (!ctx.arg.soname.empty())
+    ctx.dynstr->add_string(ctx.arg.soname);
 
   // Scan relocations to find symbols that need entries in .got, .plt,
   // .got.plt, .dynsym, .dynstr, etc.
@@ -589,7 +595,8 @@ static int elf_main(int argc, char **argv) {
   ctx.dynsym->finalize(ctx);
 
   // Fill .gnu.version_d section contents.
-  ctx.verdef->construct(ctx);
+  if (ctx.verdef)
+    ctx.verdef->construct(ctx);
 
   // Fill .gnu.version_r section contents.
   ctx.verneed->construct(ctx);
@@ -600,15 +607,12 @@ static int elf_main(int argc, char **argv) {
   // .eh_frame is a special section from the linker's point of view,
   // as its contents are parsed and reconstructed by the linker,
   // unlike other sections that are regarded as opaque bytes.
-  // Here, we transplant .eh_frame sections from a regular output
-  // section to the special EHFrameSection.
-  {
-    Timer t(ctx, "eh_frame");
-    std::erase_if(ctx.chunks, [](Chunk<E> *chunk) {
-      return chunk->is_output_section() && chunk->name == ".eh_frame";
-    });
-    ctx.eh_frame->construct(ctx);
-  }
+  // Here, we construct output .eh_frame contents.
+  ctx.eh_frame->construct(ctx);
+
+  // Handle --gdb-index.
+  if (ctx.arg.gdb_index)
+    ctx.gdb_index->construct(ctx);
 
   // If --emit-relocs is given, we'll copy relocation sections from input
   // files to an output file.
@@ -639,14 +643,14 @@ static int elf_main(int argc, char **argv) {
   // On ARM64, we may need to create so-called "range extension thunks"
   // to extend branch instructions reach, as they can jump only to
   // ±128 MiB.
-  if constexpr (E::e_machine == EM_AARCH64)
+  if constexpr (std::is_same_v<E, ARM64>)
     filesize = create_range_extension_thunks(ctx);
 
   // On RISC-V, branches are encode using multiple instructions so
   // that they can jump to anywhere in ±2 GiB by default. They may
   // be replaced with shorter instruction sequences if destinations
   // are close enough. Do this optimization.
-  if constexpr (E::e_machine == EM_RISCV)
+  if constexpr (std::is_same_v<E, RISCV64>)
     filesize = riscv_resize_sections(ctx);
 
   // Fix linker-synthesized symbol addresses.
@@ -661,16 +665,6 @@ static int elf_main(int argc, char **argv) {
     filesize = compress_debug_sections(ctx);
 
   // At this point, file layout is fixed.
-
-  // Some types of TLS relocations are defined relative to the beginning
-  // or the end of the TLS segment address. Find these addresses now.
-  for (ElfPhdr<E> phdr : create_phdr(ctx)) {
-    if (phdr.p_type == PT_TLS) {
-      ctx.tls_begin = phdr.p_vaddr;
-      ctx.tls_end = align_to(phdr.p_vaddr + phdr.p_memsz, phdr.p_align);
-      break;
-    }
-  }
 
   t_before_copy.stop();
 
@@ -694,8 +688,17 @@ static int elf_main(int argc, char **argv) {
     ctx.checkpoint();
   }
 
-  if constexpr (E::e_machine == EM_AARCH64)
+  if constexpr (std::is_same_v<E, ARM64>)
     write_thunks(ctx);
+
+  if constexpr (std::is_same_v<E, ARM32>)
+    sort_arm_exidx(ctx);
+
+  // Some part of .gdb_index couldn't be computed until other debug
+  // sections are complete. We have complete debug sections now, so
+  // write the rest of .gdb_index.
+  if (ctx.gdb_index)
+    ctx.gdb_index->write_address_areas(ctx);
 
   // Dynamic linker works better with sorted .rela.dyn section,
   // so we sort them.

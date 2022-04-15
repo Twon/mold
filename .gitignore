@@ -12,3 +12,4 @@ ld64.mold
 gentoo
 out
 /build
+/mold-*.tar.gz

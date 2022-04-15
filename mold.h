@@ -351,7 +351,7 @@ public:
   }
 
   bool has_key(i64 idx) {
-    return keys[idx];
+    return keys[idx].load(std::memory_order_relaxed);
   }
 
   static constexpr i64 MIN_NBUCKETS = 2048;
@@ -604,9 +604,6 @@ public:
 
 template <typename C>
 MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
-  MappedFile *mf = new MappedFile;
-  mf->name = path;
-
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
     path = ctx.arg.chroot + "/" + path_clean(path);
 
@@ -614,12 +611,14 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   if (fd == -1)
     return nullptr;
 
-  ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
-
   struct stat st;
   if (fstat(fd, &st) == -1)
     Fatal(ctx) << path << ": fstat failed: " << errno_string();
 
+  MappedFile *mf = new MappedFile;
+  ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
+
+  mf->name = path;
   mf->size = st.st_size;
 
 #ifdef __APPLE__

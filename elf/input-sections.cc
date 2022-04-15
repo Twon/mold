@@ -131,12 +131,10 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
   bool is_writable = (shdr().sh_flags & SHF_WRITE);
 
   auto error = [&] {
-    if (sym.is_absolute())
-      Error(ctx) << *this << ": " << rel << " relocation against symbol `"
-                 << sym << "' can not be used; recompile with -fno-PIC";
-    else
-      Error(ctx) << *this << ": " << rel << " relocation against symbol `"
-                 << sym << "' can not be used; recompile with -fPIC";
+    std::string msg = sym.is_absolute() ? "-fno-PIC" : "-fPIC";
+    Error(ctx) << *this << ": " << rel << " relocation at offset 0x"
+               << std::hex << rel.r_offset << " against symbol `"
+               << sym << "' can not be used; recompile with " << msg;
   };
 
   auto warn_textrel = [&] {
@@ -170,6 +168,12 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
   case PLT:
     sym.flags |= NEEDS_PLT;
     return;
+  case CPLT: {
+    std::scoped_lock lock(sym.mu);
+    sym.flags |= NEEDS_PLT;
+    sym.is_canonical = true;
+    return;
+  }
   case DYNREL:
     if (!is_writable) {
       if (ctx.arg.z_text) {
@@ -207,7 +211,7 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
     return;
 
   // Copy data
-  if constexpr (E::e_machine == EM_RISCV) {
+  if constexpr (std::is_same_v<E, RISCV64>) {
     copy_contents_riscv(ctx, buf);
   } else if (is_compressed()) {
     uncompress(ctx, buf);

@@ -434,7 +434,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       *(u32 *)loc = S + A;
       break;
     case R_RISCV_64:
-      *(u64 *)loc = S + A;
+      if (std::optional<u64> val = get_tombstone(sym))
+        *(u64 *)loc = *val;
+      else
+        *(u64 *)loc = S + A;
       break;
     case R_RISCV_ADD8:
       *loc += S + A;
@@ -556,7 +559,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         // Absolute  Local    Imported data  Imported code
         {  NONE,     ERROR,   ERROR,         ERROR },      // DSO
         {  NONE,     ERROR,   ERROR,         ERROR },      // PIE
-        {  NONE,     NONE,    COPYREL,       PLT   },      // PDE
+        {  NONE,     NONE,    COPYREL,       CPLT  },      // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -566,7 +569,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         // Absolute  Local    Imported data  Imported code
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       PLT    },     // PDE
+        {  NONE,     NONE,    COPYREL,       CPLT   },     // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;

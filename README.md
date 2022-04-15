@@ -22,7 +22,7 @@ mold is so fast that it is only 2x _slower_ than `cp` on the same
 machine. Feel free to [file a bug](https://github.com/rui314/mold/issues)
 if you find mold is not faster than other linkers.
 
-mold currently supports x86-64, i386, ARM64 and 64-bit RISC-V.
+mold currently supports x86-64, i386, ARM32, ARM64 and 64-bit RISC-V.
 
 ## Why does the speed of linking matter?
 
@@ -168,6 +168,14 @@ variable set to its companion shared object file. The shared object
 file intercepts all function calls to `exec(3)`-family functions to
 replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
 
+</details>
+
+<details><summary>GitHub Action</summary>
+If you want to use mold in your GitHub-hosted CI to speed up continuous
+build, you can use <a href=https://github.com/rui314/setup-mold>setup-mold</a>
+GitHub Action. GitHub runs a CI on a two-core machine, but mold is
+still significantly faster than the default GNU linker there
+especially when a program being linked is large.
 </details>
 
 <details><summary>Verify that you are using mold</summary>

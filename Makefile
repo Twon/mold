@@ -1,6 +1,6 @@
 # If you want to enable ASAN, run `make` with the following options:
 #
-# make CXXFLAGS=-fsanitize=address LDFLAGS=-fsanitize=address USE_MIMALLOC=0
+# make CXXFLAGS='-fsanitize=address -g' LDFLAGS=-fsanitize=address USE_MIMALLOC=0
 
 VERSION = 1.1.1
 
@@ -161,12 +161,39 @@ ifeq ($(OS), Darwin)
 else
 	$(MAKE) -C test -f Makefile.linux --no-print-directory --output-sync
 endif
-
 	@if test -t 1; then \
 	  printf '\e[32mPassed all tests\e[0m\n'; \
 	else \
 	  echo 'Passed all tests'; \
 	fi
+
+test-x86-64: all
+	@echo x86_64
+	CC=x86_64-linux-gnu-gcc CXX=x86_64-linux-gnu-g++ GCC=x86_64-linux-gnu-gcc GXX=x86_64-linux-gnu-g++ OBJDUMP=x86_64-linux-gnu-objdump MACHINE=x86_64 QEMU='qemu-x86_64 -L /usr/x86_64-linux-gnu' $(MAKE) test
+
+test-i386: all
+	@echo i386
+	CC=i686-linux-gnu-gcc CXX=i686-linux-gnu-g++ GCC=i686-linux-gnu-gcc GXX=i686-linux-gnu-g++ OBJDUMP=x86_64-linux-gnu-objdump MACHINE=i386 QEMU='qemu-i386 -L /usr/i686-linux-gnu' $(MAKE) test
+
+test-arm64: all
+	@echo arm64
+	CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ GCC=aarch64-linux-gnu-gcc GXX=aarch64-linux-gnu-g++ OBJDUMP=aarch64-linux-gnu-objdump MACHINE=aarch64 QEMU='qemu-aarch64 -L /usr/aarch64-linux-gnu' $(MAKE) test
+
+test-arm32: all
+	@echo arm
+	CC=arm-linux-gnueabihf-gcc CXX=arm-linux-gnueabihf-g++ GCC=arm-linux-gnueabihf-gcc GXX=arm-linux-gnueabihf-g++ OBJDUMP=arm-linux-gnueabihf-objdump MACHINE=arm QEMU='qemu-arm -L /usr/arm-linux-gnueabihf' $(MAKE) test
+
+test-riscv64: all
+	@echo riscv64
+	CC=riscv64-linux-gnu-gcc CXX=riscv64-linux-gnu-g++ GCC=riscv64-linux-gnu-gcc GXX=riscv64-linux-gnu-g++ OBJDUMP=riscv64-linux-gnu-objdump MACHINE=riscv64 QEMU='qemu-riscv64 -L /usr/riscv64-linux-gnu' $(MAKE) test
+
+
+test-all:
+	$(MAKE) test-x86-64
+	$(MAKE) test-i386
+	$(MAKE) test-arm64
+	$(MAKE) test-arm32
+	$(MAKE) test-riscv64
 
 install: all
 	$(INSTALL) -d $D$(BINDIR)
@@ -194,4 +221,4 @@ uninstall:
 clean:
 	rm -rf *~ mold mold-wrapper.so out ld ld64.mold
 
-.PHONY: all test tests check clean
+.PHONY: all test tests check clean test-x86-64 test-i386 test-arm64 test-arm32 test-riscv64 test-all

@@ -181,12 +181,15 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_AARCH64_ADD_ABS_LO12_NC:
       *(u32 *)loc |= bits(S + A, 11, 0) << 10;
       continue;
+    case R_AARCH64_MOVW_UABS_G0:
     case R_AARCH64_MOVW_UABS_G0_NC:
       *(u32 *)loc |= bits(S + A, 15, 0) << 5;
       continue;
+    case R_AARCH64_MOVW_UABS_G1:
     case R_AARCH64_MOVW_UABS_G1_NC:
       *(u32 *)loc |= bits(S + A, 31, 16) << 5;
       continue;
+    case R_AARCH64_MOVW_UABS_G2:
     case R_AARCH64_MOVW_UABS_G2_NC:
       *(u32 *)loc |= bits(S + A, 47, 32) << 5;
       continue;
@@ -233,7 +236,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(u32 *)loc |= (val >> 2) & 0x3ffffff;
       continue;
     }
-    case R_AARCH64_CONDBR19: {
+    case R_AARCH64_CONDBR19:
+    case R_AARCH64_LD_PREL_LO19: {
       i64 val = S + A - P;
       overflow_check(val, -((i64)1 << 20), (i64)1 << 20);
       *(u32 *)loc |= bits(val, 20, 2) << 5;
@@ -278,6 +282,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(u32 *)loc |= bits(val, 23, 12) << 10;
       continue;
     }
+    case R_AARCH64_TLSLE_ADD_TPREL_LO12:
     case R_AARCH64_TLSLE_ADD_TPREL_LO12_NC:
       *(u32 *)loc |= bits(S + A - ctx.tls_begin + 16, 11, 0) << 10;
       continue;
@@ -364,7 +369,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
-      *(u64 *)loc = S + A;
+      if (std::optional<u64> val = get_tombstone(sym))
+        *(u64 *)loc = *val;
+      else
+        *(u64 *)loc = S + A;
       continue;
     case R_AARCH64_ABS32:
       *(u32 *)loc = S + A;
@@ -411,7 +419,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         // Absolute  Local    Imported data  Imported code
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       PLT    },     // PDE
+        {  NONE,     NONE,    COPYREL,       CPLT   },     // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -435,7 +443,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         // Absolute  Local    Imported data  Imported code
         {  ERROR,    NONE,    ERROR,         ERROR },      // DSO
         {  ERROR,    NONE,    COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,    COPYREL,       PLT   },      // PDE
+        {  NONE,     NONE,    COPYREL,       CPLT  },      // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -452,19 +460,24 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_AARCH64_ADD_ABS_LO12_NC:
     case R_AARCH64_ADR_PREL_LO21:
     case R_AARCH64_CONDBR19:
+    case R_AARCH64_LD_PREL_LO19:
     case R_AARCH64_LDST16_ABS_LO12_NC:
     case R_AARCH64_LDST32_ABS_LO12_NC:
     case R_AARCH64_LDST64_ABS_LO12_NC:
     case R_AARCH64_LDST128_ABS_LO12_NC:
     case R_AARCH64_LDST8_ABS_LO12_NC:
+    case R_AARCH64_MOVW_UABS_G0:
     case R_AARCH64_MOVW_UABS_G0_NC:
+    case R_AARCH64_MOVW_UABS_G1:
     case R_AARCH64_MOVW_UABS_G1_NC:
+    case R_AARCH64_MOVW_UABS_G2:
     case R_AARCH64_MOVW_UABS_G2_NC:
     case R_AARCH64_MOVW_UABS_G3:
     case R_AARCH64_PREL16:
     case R_AARCH64_PREL32:
     case R_AARCH64_PREL64:
     case R_AARCH64_TLSLE_ADD_TPREL_HI12:
+    case R_AARCH64_TLSLE_ADD_TPREL_LO12:
     case R_AARCH64_TLSLE_ADD_TPREL_LO12_NC:
     case R_AARCH64_TLSGD_ADD_LO12_NC:
     case R_AARCH64_TLSDESC_CALL:
@@ -479,7 +492,7 @@ static void reset_thunk(RangeExtensionThunk<E> &thunk) {
   for (Symbol<E> *sym : thunk.symbols) {
     sym->extra.thunk_idx = -1;
     sym->extra.thunk_sym_idx = -1;
-    sym->flags &= (u8)~NEEDS_THUNK;
+    sym->flags &= (u8)~NEEDS_RANGE_EXTN_THUNK;
   }
 }
 
@@ -583,7 +596,8 @@ static void create_thunks(Context<E> &ctx, OutputSection<E> &osec) {
         // Otherwise, add the symbol to this thunk if it's not added already.
         range_extn[i] = {thunk.thunk_idx, -1};
 
-        if (!(sym.flags.fetch_or(NEEDS_THUNK) & NEEDS_THUNK)) {
+        if (!(sym.flags.fetch_or(NEEDS_RANGE_EXTN_THUNK) &
+              NEEDS_RANGE_EXTN_THUNK)) {
           std::scoped_lock lock(thunk.mu);
           thunk.symbols.push_back(&sym);
         }

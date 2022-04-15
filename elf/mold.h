@@ -23,6 +23,7 @@
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/spin_mutex.h>
 #include <tbb/task_group.h>
+#include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -306,12 +307,12 @@ public:
 
   // For COMDAT de-duplication and garbage collection
   std::atomic_bool is_alive = true;
+  bool killed_by_icf = false;
 
-  bool is_ehframe = false;
   u8 p2align = 0;
 
 private:
-  typedef enum : u8 { NONE, ERROR, COPYREL, PLT, DYNREL, BASEREL } Action;
+  typedef enum : u8 { NONE, ERROR, COPYREL, PLT, CPLT, DYNREL, BASEREL } Action;
 
   void dispatch(Context<E> &ctx, Action table[3][4], i64 i,
                 const ElfRel<E> &rel, Symbol<E> &sym);
@@ -321,6 +322,7 @@ private:
   std::pair<SectionFragment<E> *, i64>
   get_fragment(Context<E> &ctx, const ElfRel<E> &rel);
 
+  std::optional<u64> get_tombstone(Symbol<E> &sym);
   bool is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel);
 };
 
@@ -441,6 +443,14 @@ private:
 };
 
 template <typename E>
+struct GotEntry {
+  i64 idx = 0;
+  u64 val = 0;
+  i64 r_type = 0;
+  Symbol<E> *sym = nullptr;
+};
+
+template <typename E>
 class GotSection : public Chunk<E> {
 public:
   GotSection() {
@@ -468,6 +478,9 @@ public:
 
   void construct_relr(Context<E> &ctx);
   std::vector<typename E::WordTy> relr;
+
+private:
+  std::vector<GotEntry<E>> get_entries(Context<E> &ctx) const;
 };
 
 template <typename E>
@@ -478,6 +491,7 @@ public:
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = E::word_size;
+    this->shdr.sh_size = E::word_size * 3;
   }
 
   void copy_buf(Context<E> &ctx) override;
@@ -594,9 +608,9 @@ public:
     this->name = ".dynstr";
     this->shdr.sh_type = SHT_STRTAB;
     this->shdr.sh_flags = SHF_ALLOC;
-    this->shdr.sh_size = 1;
   }
 
+  void keep() { this->shdr.sh_size = 1; }
   i64 add_string(std::string_view str);
   i64 find_string(std::string_view str);
   void copy_buf(Context<E> &ctx) override;
@@ -647,12 +661,13 @@ public:
     this->shdr.sh_addralign = E::word_size;
   }
 
+  void keep() { this->symbols.resize(1); }
   void add_symbol(Context<E> &ctx, Symbol<E> *sym);
   void finalize(Context<E> &ctx);
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 
-  std::vector<Symbol<E> *> symbols{1};
+  std::vector<Symbol<E> *> symbols;
 };
 
 template <typename E>
@@ -852,6 +867,67 @@ public:
   u32 features = 0;
 };
 
+struct GdbIndexName {
+  std::string_view name;
+  u32 hash = 0;
+  u32 offset = 0;
+  u32 attr = 0;
+  u32 entry_idx = 0;
+};
+
+template <typename E>
+class GdbIndexSection : public Chunk<E> {
+public:
+  GdbIndexSection() {
+    this->name = ".gdb_index";
+    this->shdr.sh_type = SHT_PROGBITS;
+  }
+
+  void construct(Context<E> &ctx);
+  void copy_buf(Context<E> &ctx) override;
+  void write_address_areas(Context<E> &ctx);
+
+private:
+  struct SectionHeader {
+    u32 version = 7;
+    u32 cu_list_offset = 0;
+    u32 cu_types_offset = 0;
+    u32 areas_offset = 0;
+    u32 symtab_offset = 0;
+    u32 const_pool_offset = 0;
+  };
+
+  struct MapEntry {
+    MapEntry(u32 hash) : hash(hash) {}
+
+    MapEntry(const MapEntry &other) {
+      hash = other.hash;
+      name_offset = other.name_offset;
+      attr_offset = other.attr_offset;
+      num_attrs = other.num_attrs.load();
+    }
+
+    u32 hash = 0;
+    u32 name_offset = 0;
+    u32 attr_offset = 0;
+    std::atomic_uint32_t num_attrs = 0;
+  };
+
+  SectionHeader header;
+  i64 num_symtab_entries = 0;
+  i64 attrs_size = 0;
+
+  std::vector<std::string_view>
+  read_compunits(Context<E> &ctx, ObjectFile<E> &file);
+
+  std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file);
+
+  std::vector<u64> read_address_areas(Context<E> &ctx, ObjectFile<E> &file,
+                                      i64 offset);
+
+  ConcurrentMap<MapEntry> map;
+};
+
 template <typename E>
 class GabiCompressedSection : public Chunk<E> {
 public:
@@ -1044,6 +1120,18 @@ public:
   std::vector<std::vector<ElfRel<E>>> sorted_rels;
   std::vector<std::vector<Symbol<E> *>> sorted_symbols;
 
+  // For .gdb_index
+  InputSection<E> *debug_info = nullptr;
+  InputSection<E> *debug_abbrev = nullptr;
+  InputSection<E> *debug_ranges = nullptr;
+  InputSection<E> *debug_pubnames = nullptr;
+  InputSection<E> *debug_pubtypes = nullptr;
+  std::vector<std::string_view> compunits;
+  i64 num_areas = 0;
+  i64 area_offset = 0;
+  i64 compunits_idx = 0;
+  std::vector<GdbIndexName> pubnames;
+
 private:
   ObjectFile(Context<E> &ctx, MappedFile<Context<E>> *mf,
              std::string archive_name, bool is_in_lib);
@@ -1063,7 +1151,7 @@ private:
   uncompress_contents(Context<E> &ctx, const ElfShdr<E> &shdr,
                       std::string_view name);
 
-  bool has_common_symbol;
+  bool has_common_symbol = false;
 
   std::string_view symbol_strtab;
   const ElfShdr<E> *symtab_sec;
@@ -1267,6 +1355,7 @@ template <typename E> void print_dependencies_full(Context<E> &);
 template <typename E> void write_repro_file(Context<E> &);
 template <typename E> void check_duplicate_symbols(Context<E> &);
 template <typename E> void sort_init_fini(Context<E> &);
+template <typename E> void sort_ctor_dtor(Context<E> &);
 template <typename E> void shuffle_sections(Context<E> &);
 template <typename E> std::vector<Chunk<E> *>
 collect_output_sections(Context<E> &);
@@ -1285,6 +1374,43 @@ template <typename E> i64 set_osec_offsets(Context<E> &);
 template <typename E> void fix_synthetic_symbols(Context<E> &);
 template <typename E> i64 compress_debug_sections(Context<E> &);
 template <typename E> void write_dependency_file(Context<E> &);
+
+//
+// arch-arm64.cc
+//
+
+class ThumbToArmSection : public Chunk<ARM32> {
+public:
+  ThumbToArmSection() {
+    this->name = ".thumb_to_arm";
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    this->shdr.sh_addralign = 4;
+  }
+
+  void add_symbol(Context<ARM32> &ctx, Symbol<ARM32> *sym);
+  void update_shdr(Context<ARM32> &ctx) override;
+  void copy_buf(Context<ARM32> &ctx) override;
+
+  std::vector<Symbol<ARM32> *> symbols;
+
+  static constexpr i64 ENTRY_SIZE = 8;
+};
+
+class TlsTrampolineSection : public Chunk<ARM32> {
+public:
+  TlsTrampolineSection() {
+    this->name = ".tls_trampoline";
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    this->shdr.sh_addralign = 4;
+    this->shdr.sh_size = 12;
+  }
+
+  void copy_buf(Context<ARM32> &ctx) override;
+};
+
+void sort_arm_exidx(Context<ARM32> &ctx);
 
 //
 // arch-arm64.cc
@@ -1427,16 +1553,19 @@ struct Context {
     bool discard_locals = false;
     bool eh_frame_hdr = true;
     bool emit_relocs = false;
+    bool enable_new_dtags = true;
     bool export_dynamic = false;
     bool fatal_warnings = false;
     bool fork = true;
     bool gc_sections = false;
+    bool gdb_index = false;
     bool hash_style_gnu = false;
     bool hash_style_sysv = true;
     bool icf = false;
     bool is_static = false;
     bool lto_pass2 = false;
     bool noinhibit_exec = false;
+    bool oformat_binary = false;
     bool omagic = false;
     bool pack_dyn_relocs_relr = false;
     bool perf = false;
@@ -1496,6 +1625,7 @@ struct Context {
     std::string soname;
     std::string sysroot;
     std::unique_ptr<std::unordered_set<std::string_view>> retain_symbols_file;
+    std::unordered_map<std::string_view, u64> section_start;
     std::unordered_set<std::string_view> ignore_ir_file;
     std::unordered_set<std::string_view> wrap;
     std::vector<std::pair<Symbol<E> *, std::variant<Symbol<E> *, u64>>> defsyms;
@@ -1599,6 +1729,9 @@ struct Context {
   std::unique_ptr<VerdefSection<E>> verdef;
   std::unique_ptr<BuildIdSection<E>> buildid;
   std::unique_ptr<NotePropertySection<E>> note_property;
+  std::unique_ptr<GdbIndexSection<E>> gdb_index;
+  std::unique_ptr<ThumbToArmSection> thumb_to_arm;
+  std::unique_ptr<TlsTrampolineSection> tls_trampoline;
 
   // For --relocatable
   std::vector<RChunk<E> *> r_chunks;
@@ -1615,10 +1748,13 @@ struct Context {
   // Linker-synthesized symbols
   Symbol<E> *_DYNAMIC = nullptr;
   Symbol<E> *_GLOBAL_OFFSET_TABLE_ = nullptr;
+  Symbol<E> *_TLS_MODULE_BASE_ = nullptr;
   Symbol<E> *__GNU_EH_FRAME_HDR = nullptr;
   Symbol<E> *__bss_start = nullptr;
   Symbol<E> *__ehdr_start = nullptr;
   Symbol<E> *__executable_start = nullptr;
+  Symbol<E> *__exidx_end = nullptr;
+  Symbol<E> *__exidx_start = nullptr;
   Symbol<E> *__fini_array_end = nullptr;
   Symbol<E> *__fini_array_start = nullptr;
   Symbol<E> *__global_pointer = nullptr;
@@ -1655,18 +1791,24 @@ std::ostream &operator<<(std::ostream &out, const InputFile<E> &file);
 //
 
 enum {
-  NEEDS_GOT      = 1 << 0,
-  NEEDS_PLT      = 1 << 1,
-  NEEDS_GOTTP    = 1 << 2,
-  NEEDS_TLSGD    = 1 << 3,
-  NEEDS_COPYREL  = 1 << 4,
-  NEEDS_TLSDESC  = 1 << 5,
-  NEEDS_THUNK    = 1 << 6,
+  NEEDS_GOT                = 1 << 0,
+  NEEDS_PLT                = 1 << 1,
+  NEEDS_GOTTP              = 1 << 2,
+  NEEDS_TLSGD              = 1 << 3,
+  NEEDS_COPYREL            = 1 << 4,
+  NEEDS_TLSDESC            = 1 << 5,
+  NEEDS_THUMB_TO_ARM_THUNK = 1 << 6,
+  NEEDS_RANGE_EXTN_THUNK   = 1 << 7,
 };
 
 // A struct to hold taret-dependent symbol members;
 template <typename E>
 struct SymbolExtras {};
+
+template <>
+struct SymbolExtras<ARM32> {
+  i32 thumb_to_arm_thunk_idx = -1;
+};
 
 template <>
 struct SymbolExtras<ARM64> {
@@ -1754,35 +1896,113 @@ public:
   std::atomic_uint8_t visibility = STV_DEFAULT;
 
   u8 is_weak : 1 = false;
-  u8 write_to_symtab : 1 = false;
-  u8 traced : 1 = false;
-  u8 wrap : 1 = false;
-  u8 has_copyrel : 1 = false;
-  u8 copyrel_readonly : 1 = false;
+  u8 write_to_symtab : 1 = false; // for --strip-all and the like
+  u8 traced : 1 = false;          // for --trace-symbol
+  u8 wrap : 1 = false;            // for --wrap
 
-  // If a symbol can be interposed at runtime, `is_imported` is true.
-  // If a symbol is a dynamic symbol and can be used by other ELF
-  // module at runtime, `is_exported` is true.
+  // If a symbol can be resolved to a symbol in a different ELF file at
+  // runtime, `is_imported` is true. If a symbol is a dynamic symbol and
+  // can be used by other ELF file at runtime, `is_exported` is true.
   //
-  // Note that both can be true at the same time. Such symbol
-  // represents a function or data exported from this ELF module
-  // which can be interposed by other definition at runtime.
-  // That is the usual exported symbols when creating a DSO.
-  // In other words, a dynamic symbol is exported by a DSO and
-  // imported by itself.
+  // Note that both can be true at the same time. Such symbol represents
+  // a function or data exported from this ELF file which can be
+  // imported by other definition at runtime. That is actually a usual
+  // exported symbol when creating a DSO. In other words, a dynamic
+  // symbol exported by a DSO is usually imported by itself.
   //
   // If is_imported is true and is_exported is false, it is a dynamic
-  // symbol imported from other DSO.
+  // symbol just imported from other DSO.
   //
   // If is_imported is false and is_exported is true, there are two
   // possible cases. If we are creating an executable, we know that
-  // exported symbols cannot be interposed by any DSO (because the
-  // dynamic loader searches a dynamic symbol from an executable
-  // before examining any DSOs), so any exported symbol is export-only.
-  // If we are creating a DSO, export-only symbols represent a
-  // protected symbol (i.e. a symbol whose visibility is STV_PROTECTED).
+  // exported symbols cannot be intercepted by any DSO (because the
+  // dynamic loader searches a dynamic symbol from an executable before
+  // examining any DSOs), so any exported symbol is export-only in an
+  // executable. If we are creating a DSO, export-only symbols
+  // represent a protected symbol (i.e. a symbol whose visibility is
+  // STV_PROTECTED).
   u8 is_imported : 1 = false;
   u8 is_exported : 1 = false;
+
+  // `is_canonical` is true if this symbol represents a "canonical" PLT.
+  // Here is the explanation as to what is the canonical PLT is.
+  //
+  // In C/C++, the process-wide function pointer equality is guaratneed.
+  // That is, if you take an address of a function `foo`, it's always
+  // evaluated to the same address wherever you do that.
+  //
+  // For the sake of explanation, assume that `libx.so` exports a
+  // function symbol `foo`, and there's a program that uses `libx.so`.
+  // Both `libx.so` and the main executable take the address of `foo`,
+  // which must be evaluated to the same address because of the above
+  // guarantee.
+  //
+  // If the main executable is position-independent code (PIC), `foo` is
+  // evaluated to the beginning of the function code, as you would have
+  // expected. The address of `foo` is stored to GOTs, and the machine
+  // code that takes the address of `foo` reads the GOT entries at
+  // runtime.
+  //
+  // However, if it's not PIC, the main executable's code was compiled
+  // to not use GOT (note that shared objects are always PIC, only
+  // executables can be non-PIC). It instead assumes that `foo` (and any
+  // other global variables/functions) has an address that is fixed at
+  // link-time. This assumption is correct if `foo` is in the same
+  // position-dependent executable, but it's not if `foo` is imported
+  // from some other DSO at runtime.
+  //
+  // In this case, we use the address of the `foo`'s PLT entry in the
+  // main executable (whose address is fixed at link-time) as its
+  // address. In order to guarantee pointer equality, we also need to
+  // fill foo's GOT entries in DSOs with the addres of the foo's PLT
+  // entry instead of `foo`'s real address. We can do that by setting a
+  // symbol value to `foo`'s dynamic symbol. If a symbol value is set,
+  // the dynamic loader initialize `foo`'s GOT entries with that value
+  // instead of the symbol's real address.
+  //
+  // We call such PLT entry in the main executable as "canonical".
+  // If `foo` has a canonical PLT, its address is evaluated to its
+  // canonical PLT's address. Otherwise, it's evaluated to `foo`'s
+  // address.
+  //
+  // Only non-PIC main executables may have canonical PLTs. PIC
+  // executables and shared objects never have a canonical PLT.
+  //
+  // This bit manages if we need to make this symbol's PLT canonical.
+  // This bit is meaningful only when the symbol has a PLT entry.
+  u8 is_canonical : 1 = false;
+
+  // If an input object file is not compiled with -fPIC (or with
+  // -fno-PIC), the file not position independent. That means the
+  // machine code included in the object file does not use GOT to access
+  // global variables. Instead, it assumes that addresses of global
+  // variables are known at link-time.
+  //
+  // Let's say `libx.so` exports a global variable `foo`, and a main
+  // executable uses the variable. If the executable is not compiled
+  // with -fPIC, we can't simply apply a relocation that refers `foo`
+  // because `foo`'s address is not known at link-time.
+  //
+  // In this case, we could print out the "recompile with -fPIC" error
+  // message, but there's a way to workaround.
+  //
+  // The loader supports a feature so-called "copy relocations".
+  // A copy relocation instructs the loader to copy data from a DSO to a
+  // specified location in the main executable. By using this feature,
+  // you can make `foo`'s data to a BSS region at runtime. With that,
+  // you can apply relocations agianst `foo` as if `foo` existed in the
+  // main executable's BSS area, whose address is known at link-time.
+  //
+  // Copy relocations are used only by position-dependent executables.
+  // Position-independent executables and DSOs don't need them because
+  // they use GOT to access global variables.
+  //
+  // `has_copyrel` is true if we need to emit a copy relocation for this
+  // symbol. If the original symbol in a DSO is in a read-only memory
+  // region, `copyrel_readonly` is set to true so that the copied data
+  // will become read-only at run-time.
+  u8 has_copyrel : 1 = false;
+  u8 copyrel_readonly : 1 = false;
 
   // For LTO. True if the symbol is referenced by a regular object (as
   // opposed to IR object).
@@ -1921,7 +2141,80 @@ inline i64 InputSection<I386>::get_addend(const ElfRel<I386> &rel) const {
 
 template <>
 inline i64 InputSection<ARM32>::get_addend(const ElfRel<ARM32> &rel) const {
-  unreachable();
+  u8 *loc = (u8 *)contents.data() + rel.r_offset;
+
+  auto bit = [](u32 val, i64 pos) -> i32 {
+    return (val >> pos) & 1;
+  };
+
+  // Returns [hi:lo] bits of val.
+  auto bits = [](u64 val, i64 hi, i64 lo) -> i32 {
+    return (val >> lo) & (((u64)1 << (hi - lo + 1)) - 1);
+  };
+
+  auto sign_extend = [](u64 val, i64 size) -> i32 {
+    return (i64)(val << (63 - size)) >> (63 - size);
+  };
+
+  switch (rel.r_type) {
+  case R_ARM_NONE:
+    return 0;
+  case R_ARM_ABS32:
+  case R_ARM_REL32:
+  case R_ARM_TARGET1:
+  case R_ARM_BASE_PREL:
+  case R_ARM_GOT_PREL:
+  case R_ARM_GOT_BREL:
+  case R_ARM_TLS_GD32:
+  case R_ARM_TLS_LDM32:
+  case R_ARM_TLS_LDO32:
+  case R_ARM_TLS_IE32:
+  case R_ARM_TLS_LE32:
+  case R_ARM_TLS_GOTDESC:
+  case R_ARM_TARGET2:
+    return *(i32 *)loc;
+  case R_ARM_THM_JUMP11:
+    return sign_extend(*(u16 *)loc, 10) << 1;
+  case R_ARM_THM_CALL:
+  case R_ARM_THM_JUMP24:
+  case R_ARM_THM_TLS_CALL: {
+    u32 S = bit(*(u16 *)loc, 10);
+    u32 J1 = bit(*(u16 *)(loc + 2), 13);
+    u32 J2 = bit(*(u16 *)(loc + 2), 11);
+    u32 I1 = !(J1 ^ S);
+    u32 I2 = !(J2 ^ S);
+    u32 imm10 = bits(*(u16 *)loc, 9, 0);
+    u32 imm11 = bits(*(u16 *)(loc + 2), 10, 0);
+    u32 val = (S << 24) | (I1 << 23) | (I2 << 22) | (imm10 << 12) | (imm11 << 1);
+    return sign_extend(val, 24);
+  }
+  case R_ARM_CALL:
+  case R_ARM_JUMP24:
+    return sign_extend(*(u32 *)loc & 0x00ff'ffff, 23) << 2;
+  case R_ARM_MOVW_PREL_NC:
+  case R_ARM_MOVW_ABS_NC:
+  case R_ARM_MOVT_PREL:
+  case R_ARM_MOVT_ABS: {
+    u32 imm12 = bits(*(u32 *)loc, 11, 0);
+    u32 imm4 = bits(*(u32 *)loc, 19, 16);
+    return sign_extend((imm4 << 12) | imm12, 15);
+  }
+  case R_ARM_PREL31:
+    return sign_extend(*(u32 *)loc, 30);
+  case R_ARM_THM_MOVW_PREL_NC:
+  case R_ARM_THM_MOVW_ABS_NC:
+  case R_ARM_THM_MOVT_PREL:
+  case R_ARM_THM_MOVT_ABS: {
+    u32 imm4 = bits(*(u16 *)loc, 3, 0);
+    u32 i = bit(*(u16 *)loc, 10);
+    u32 imm3 = bits(*(u16 *)(loc + 2), 14, 12);
+    u32 imm8 = bits(*(u16 *)(loc + 2), 7, 0);
+    u32 val = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
+    return sign_extend(val, 15);
+  }
+  default:
+    unreachable();
+  }
 }
 
 template <typename E>
@@ -1985,6 +2278,40 @@ InputSection<E>::get_fragment(Context<E> &ctx, const ElfRel<E> &rel) {
     Fatal(ctx) << *this << ": bad relocation at " << rel.r_sym;
   i64 idx = it - 1 - offsets.begin();
   return {m->fragments[idx], offset - offsets[idx]};
+}
+
+// Input object files may contain duplicate code for inline functions
+// and such. Linkers de-duplicate them at link-time. However, linkers
+// generaly don't remove debug info for de-duplicated functions because
+// doing that requires parsing the entire debug section.
+//
+// Instead, linkers write "tombstone" values to dead debug info records
+// instead of bogus values so that debuggers can skip them.
+//
+// This function returns a tombstone value for the symbol if the symbol
+// refers a dead debug info section.
+template <typename E>
+inline std::optional<u64> InputSection<E>::get_tombstone(Symbol<E> &sym) {
+  InputSection<E> *isec = sym.get_input_section();
+
+  // Setting a tombstone is a special feature for a dead debug section.
+  if (!isec || isec->is_alive)
+    return {};
+
+  std::string_view s = name();
+  if (!s.starts_with(".debug"))
+    return {};
+
+  // If the section was dead due to ICF, we don't want to emit debug
+  // info for that section but want to set real values to .debug_line so
+  // that users can set a breakpoint inside a merged section.
+  if (isec->killed_by_icf && s == ".debug_line")
+    return {};
+
+  // 0 is an invalid value in most debug info sections, so we use it
+  // as a tombstone value. .debug_loc and .debug_ranges reserve 0 as
+  // the terminator marker, so we use 1 if that's the case.
+  return (s == ".debug_loc" || s == ".debug_ranges") ? 1 : 0;
 }
 
 template <typename E>
@@ -2073,8 +2400,8 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
       if (!ref.frag->is_alive) {
         // This condition is met if a non-alloc section refers an
         // alloc section and if the referenced piece of data is
-        // garbage-collected. Typically, this condition is met if a
-        // debug info section referring a string constant in .rodata.
+        // garbage-collected. Typically, this condition occurs if a
+        // debug info section refers a string constant in .rodata.
         return 0;
       }
 
@@ -2093,28 +2420,32 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
       return get_plt_addr(ctx);
 
   if (InputSection<E> *isec = get_input_section()) {
-    if (isec->is_ehframe) {
-      // .eh_frame contents are parsed and reconstructed by the linker,
-      // so pointing to a specific location in a source .eh_frame
-      // section doesn't make much sense. However, CRT files contain
-      // symbols pointing to the very beginning and ending of the section.
-      if (name() == "__EH_FRAME_BEGIN__" || name() == "__EH_FRAME_LIST__" ||
-          esym().st_type == STT_SECTION)
-        return ctx.eh_frame->shdr.sh_addr;
-      if (name() == "__FRAME_END__" || name() == "__EH_FRAME_LIST_END__")
-        return ctx.eh_frame->shdr.sh_addr + ctx.eh_frame->shdr.sh_size;
-
-      // ARM object files contain "$d" local symbol at the beginning
-      // of data sections. Their values are not significant for .eh_frame,
-      // so we just treat them as offset 0.
-      if (name() == "$d" || name().starts_with("$d."))
-        return ctx.eh_frame->shdr.sh_addr;
-
-      Fatal(ctx) << "symbol referring .eh_frame is not supported: "
-                 << *this << " " << *file;
-    }
-
     if (!isec->is_alive) {
+      if (isec->killed_by_icf)
+        return isec->extra().leader->get_addr() + value;
+
+      if (isec->name() == ".eh_frame") {
+        // .eh_frame contents are parsed and reconstructed by the linker,
+        // so pointing to a specific location in a source .eh_frame
+        // section doesn't make much sense. However, CRT files contain
+        // symbols pointing to the very beginning and ending of the section.
+        if (name() == "__EH_FRAME_BEGIN__" || name() == "__EH_FRAME_LIST__" ||
+            esym().st_type == STT_SECTION)
+          return ctx.eh_frame->shdr.sh_addr;
+
+        if (name() == "__FRAME_END__" || name() == "__EH_FRAME_LIST_END__")
+          return ctx.eh_frame->shdr.sh_addr + ctx.eh_frame->shdr.sh_size;
+
+        // ARM object files contain "$d" local symbol at the beginning
+        // of data sections. Their values are not significant for .eh_frame,
+        // so we just treat them as offset 0.
+        if (name() == "$d" || name().starts_with("$d."))
+          return ctx.eh_frame->shdr.sh_addr;
+
+        Fatal(ctx) << "symbol referring .eh_frame is not supported: "
+                   << *this << " " << *file;
+      }
+
       // The control can reach here if there's a relocation that refers
       // a local symbol belonging to a comdat group section. This is a
       // violation of the spec, as all relocations should use only global
@@ -2122,6 +2453,7 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
       // relocations.
       return 0;
     }
+
     return isec->get_addr() + value;
   }
 

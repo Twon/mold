@@ -1,6 +1,7 @@
 #include "mold.h"
 #include "../sha.h"
 
+#include <cctype>
 #include <shared_mutex>
 #include <sys/mman.h>
 #include <tbb/parallel_for_each.h>
@@ -9,6 +10,7 @@
 
 namespace mold::elf {
 
+// The hash function for .hash.
 static u32 elf_hash(std::string_view name) {
   u32 h = 0;
   for (u8 c : name) {
@@ -21,10 +23,22 @@ static u32 elf_hash(std::string_view name) {
   return h;
 }
 
+// The hash function for .gnu.hash.
 static u32 djb_hash(std::string_view name) {
   u32 h = 5381;
   for (u8 c : name)
     h = (h << 5) + h + c;
+  return h;
+}
+
+// The hash function for .gdb_index.
+static u32 gdb_hash(std::string_view name) {
+  u32 h = 0;
+  for (u8 c : name) {
+    if ('A' <= c && c <= 'Z')
+      c = 'a' + c - 'A';
+    h = h * 67 + c - 113;
+  }
   return h;
 }
 
@@ -48,22 +62,24 @@ u64 get_entry_addr(Context<E> &ctx) {
 
 template <typename E>
 u64 get_eflags(Context<E> &ctx) {
+  if constexpr (std::is_same_v<E, ARM32>)
+    return EF_ARM_EABI_VER5;
+
+  if constexpr (std::is_same_v<E, RISCV64>) {
+    std::vector<ObjectFile<RISCV64> *> objs = ctx.objs;
+    std::erase(objs, ctx.internal_obj);
+
+    if (objs.empty())
+      return 0;
+
+    u32 ret = objs[0]->get_ehdr().e_flags;
+    for (ObjectFile<RISCV64> *file : std::span(objs).subspan(1))
+      if (file->get_ehdr().e_flags & EF_RISCV_RVC)
+        ret |= EF_RISCV_RVC;
+    return ret;
+  }
+
   return 0;
-}
-
-template <>
-u64 get_eflags<RISCV64>(Context<RISCV64> &ctx) {
-  std::vector<ObjectFile<RISCV64> *> objs = ctx.objs;
-  std::erase(objs, ctx.internal_obj);
-
-  if (objs.empty())
-    return 0;
-
-  u32 ret = objs[0]->get_ehdr().e_flags;
-  for (ObjectFile<RISCV64> *file : std::span(objs).subspan(1))
-    if (file->get_ehdr().e_flags & EF_RISCV_RVC)
-      ret |= EF_RISCV_RVC;
-  return ret;
 }
 
 template <typename E>
@@ -207,7 +223,8 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   };
 
   // Create a PT_PHDR for the program header itself.
-  define(PT_PHDR, PF_R, E::word_size, ctx.phdr);
+  if (ctx.phdr)
+    define(PT_PHDR, PF_R, E::word_size, ctx.phdr);
 
   // Create a PT_INTERP.
   if (ctx.interp)
@@ -245,7 +262,9 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
       if (!is_bss(first))
         while (i < end && !is_bss(chunks[i]) &&
-               to_phdr_flags(ctx, chunks[i]) == flags)
+               to_phdr_flags(ctx, chunks[i]) == flags &&
+               chunks[i]->shdr.sh_addr - first->shdr.sh_addr ==
+               chunks[i]->shdr.sh_offset - first->shdr.sh_offset)
           append(chunks[i++]);
 
       while (i < end && is_bss(chunks[i]) &&
@@ -263,10 +282,16 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
     i++;
     while (i < ctx.chunks.size() && (ctx.chunks[i]->shdr.sh_flags & SHF_TLS))
       append(ctx.chunks[i++]);
+
+    // Some types of TLS relocations are defined relative to the TLS
+    // segment, so save its addresses for easy access.
+    ElfPhdr<E> &phdr = vec.back();
+    ctx.tls_begin = phdr.p_vaddr;
+    ctx.tls_end = align_to(phdr.p_vaddr + phdr.p_memsz, phdr.p_align);
   }
 
   // Add PT_DYNAMIC
-  if (ctx.dynamic->shdr.sh_size)
+  if (ctx.dynamic && ctx.dynamic->shdr.sh_size)
     define(PT_DYNAMIC, PF_R | PF_W, 1, ctx.dynamic);
 
   // Add PT_GNU_EH_FRAME
@@ -296,6 +321,16 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
       assert(i == ctx.chunks.size() ||
              ctx.chunks[i]->shdr.sh_addr % ctx.page_size == 0);
       vec.back().p_memsz = align_to(vec.back().p_memsz, ctx.page_size);
+    }
+  }
+
+  // Add PT_ARM_EDXIDX
+  if constexpr (std::is_same_v<E, ARM32>) {
+    for (Chunk<E> *chunk : ctx.chunks) {
+      if (chunk->shdr.sh_type == SHT_ARM_EXIDX) {
+        define(PT_ARM_EXIDX, PF_R, 4, chunk);
+        break;
+      }
     }
   }
 
@@ -344,7 +379,7 @@ void RelDynSection<E>::update_shdr(Context<E> &ctx) {
 
 template <typename E>
 static ElfRel<E> reloc(u64 offset, u32 type, u32 sym, i64 addend = 0) {
-  if constexpr (E::e_machine == EM_386 || E::e_machine == EM_ARM)
+  if constexpr (std::is_same_v<E, I386> || std::is_same_v<E, ARM32>)
     return {(u32)offset, type, sym};
   else
     return {offset, type, sym, addend};
@@ -466,6 +501,9 @@ void ShstrtabSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 i64 DynstrSection<E>::add_string(std::string_view str) {
+  if (this->shdr.sh_size == 0)
+    this->shdr.sh_size = 1;
+
   if (str.empty())
     return 0;
 
@@ -576,7 +614,8 @@ static std::vector<typename E::WordTy> create_dynamic_section(Context<E> &ctx) {
     define(DT_NEEDED, ctx.dynstr->find_string(file->soname));
 
   if (!ctx.arg.rpaths.empty())
-    define(DT_RUNPATH, ctx.dynstr->find_string(ctx.arg.rpaths));
+    define(ctx.arg.enable_new_dtags ? DT_RUNPATH : DT_RPATH,
+           ctx.dynstr->find_string(ctx.arg.rpaths));
 
   if (!ctx.arg.soname.empty())
     define(DT_SONAME, ctx.dynstr->find_string(ctx.arg.soname));
@@ -748,9 +787,15 @@ static std::string_view get_output_name(Context<E> &ctx, std::string_view name) 
   if (name.starts_with( ".rodata.str"))
     return ".rodata.str";
 
+  if (name.starts_with(".ARM.exidx"))
+    return ".ARM.exidx";
+  if (name.starts_with(".ARM.extab"))
+    return ".ARM.extab";
+
   static std::string_view prefixes[] = {
     ".text.", ".data.rel.ro.", ".data.", ".rodata.", ".bss.rel.ro.", ".bss.",
     ".init_array.", ".fini_array.", ".tbss.", ".tdata.", ".gcc_except_table.",
+    ".ctors.", ".dtors.",
   };
 
   for (std::string_view prefix : prefixes) {
@@ -786,6 +831,7 @@ static std::string_view get_output_name(Context<E> &ctx, std::string_view name) 
   return name;
 }
 
+template <typename E>
 static u64 canonicalize_type(std::string_view name, u64 type) {
   if (type == SHT_PROGBITS) {
     if (name == ".init_array" || name.starts_with(".init_array."))
@@ -793,8 +839,11 @@ static u64 canonicalize_type(std::string_view name, u64 type) {
     if (name == ".fini_array" || name.starts_with(".fini_array."))
       return SHT_FINI_ARRAY;
   }
-  if (type == SHT_X86_64_UNWIND)
-    return SHT_PROGBITS;
+
+  if constexpr (std::is_same_v<E, X86_64>)
+    if (type == SHT_X86_64_UNWIND)
+      return SHT_PROGBITS;
+
   return type;
 }
 
@@ -803,8 +852,8 @@ OutputSection<E> *
 OutputSection<E>::get_instance(Context<E> &ctx, std::string_view name,
                                u64 type, u64 flags) {
   name = get_output_name(ctx, name);
-  type = canonicalize_type(name, type);
-  flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED;
+  type = canonicalize_type<E>(name, type);
+  flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED & ~(u64)SHF_LINK_ORDER;
 
   // .init_array is usually writable. We don't want to create multiple
   // .init_array output sections, so make it always writable.
@@ -964,7 +1013,7 @@ void GotSection<E>::add_tlsgd_symbol(Context<E> &ctx, Symbol<E> *sym) {
 
 template <typename E>
 void GotSection<E>::add_tlsdesc_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  assert(E::e_machine != EM_RISCV);
+  assert(E::supports_tlsdesc);
   sym->set_tlsdesc_idx(ctx, this->shdr.sh_size / E::word_size);
   this->shdr.sh_size += E::word_size * 2;
   tlsdesc_syms.push_back(sym);
@@ -988,23 +1037,92 @@ u64 GotSection<E>::get_tlsld_addr(Context<E> &ctx) const {
 template <typename E>
 i64 GotSection<E>::get_reldyn_size(Context<E> &ctx) const {
   i64 n = 0;
-  for (Symbol<E> *sym : got_syms)
-    if (sym->is_imported ||
-        sym->get_type() == STT_GNU_IFUNC ||
-        (ctx.arg.pic && sym->is_relative() && !ctx.arg.pack_dyn_relocs_relr))
+  for (GotEntry<E> &ent : get_entries(ctx))
+    if (ent.r_type &&
+        (ent.r_type != E::R_RELATIVE || !ctx.arg.pack_dyn_relocs_relr))
       n++;
+  return n * sizeof(ElfRel<E>);
+}
 
-  n += tlsgd_syms.size() * 2;
-  n += tlsdesc_syms.size();
+// Fill .got and .rel.dyn.
+template <typename E>
+std::vector<GotEntry<E>> GotSection<E>::get_entries(Context<E> &ctx) const {
+  std::vector<GotEntry<E>> entries;
 
-  for (Symbol<E> *sym : gottp_syms)
-    if (sym->is_imported || ctx.arg.shared)
-      n++;
+  for (Symbol<E> *sym : got_syms) {
+    i64 idx = sym->get_got_idx(ctx);
+
+    // If the symbol may not be defined within our output, let the
+    // dynamic linker to resolve it.
+    if (sym->is_imported) {
+      entries.push_back({idx, 0, E::R_GLOB_DAT, sym});
+      continue;
+    }
+
+    // IFUNC always needs to be fixed up by the dynamic linker.
+    if (sym->get_type() == STT_GNU_IFUNC) {
+      entries.push_back({idx, sym->get_addr(ctx, false), E::R_IRELATIVE});
+      continue;
+    }
+
+    // If we know the address at address at link-time, fill that GOT entry
+    // now. It may need a base relocation, though.
+    if (ctx.arg.pic && sym->is_relative())
+      entries.push_back({idx, sym->get_addr(ctx, false), E::R_RELATIVE});
+    else
+      entries.push_back({idx, sym->get_addr(ctx, false)});
+  }
+
+  for (Symbol<E> *sym : tlsgd_syms) {
+    i64 idx = sym->get_tlsgd_idx(ctx);
+
+    if (ctx.arg.is_static) {
+      entries.push_back({idx, 1});
+      entries.push_back({idx + 1, sym->get_addr(ctx) - ctx.tls_begin});
+    } else {
+      entries.push_back({idx, 0, E::R_DTPMOD, sym});
+      entries.push_back({idx + 1, 0, E::R_DTPOFF, sym});
+    }
+  }
+
+  if constexpr (E::supports_tlsdesc)
+    for (Symbol<E> *sym : tlsdesc_syms)
+      entries.push_back({sym->get_tlsdesc_idx(ctx), 0, E::R_TLSDESC,
+                         sym == ctx._TLS_MODULE_BASE_ ? nullptr : sym});
+
+  for (Symbol<E> *sym : gottp_syms) {
+    i64 idx = sym->get_gottp_idx(ctx);
+
+    // If we know nothing about the symbol, let the dynamic linker
+    // to fill the GOT entry.
+    if (sym->is_imported) {
+      entries.push_back({idx, 0, E::R_TPOFF, sym});
+      continue;
+    }
+
+    // If we know the offset within the current thread vector,
+    // let the dynamic linker to adjust it.
+    if (ctx.arg.shared) {
+      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin, E::R_TPOFF});
+      continue;
+    }
+
+    // Otherwise, we know the offset at link-time, so fill the GOT entry.
+    if constexpr (std::is_same_v<E, X86_64> || std::is_same_v<E, I386>)
+      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_end});
+    else if constexpr (std::is_same_v<E, ARM32>)
+      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin + 8});
+    else if constexpr (std::is_same_v<E, ARM64>)
+      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin + 16});
+    else if constexpr (std::is_same_v<E, RISCV64>)
+      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin});
+    else
+      unreachable();
+  }
 
   if (tlsld_idx != -1)
-    n++;
-
-  return n * sizeof(ElfRel<E>);
+    entries.push_back({tlsld_idx, 0, E::R_DTPMOD});
+  return entries;
 }
 
 // Fill .got and .rel.dyn.
@@ -1017,80 +1135,24 @@ void GotSection<E>::copy_buf(Context<E> &ctx) {
 
   ElfRel<E> *rel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset);
 
-  for (Symbol<E> *sym : got_syms) {
-    u64 addr = sym->get_got_addr(ctx);
+  for (GotEntry<E> &ent : get_entries(ctx)) {
+    buf[ent.idx] = ent.val;
 
-    // If the symbol may not be defined within our output, let the
-    // dynamic linker to resolve it.
-    if (sym->is_imported) {
-      *rel++ = reloc<E>(addr, E::R_GLOB_DAT, sym->get_dynsym_idx(ctx));
-      continue;
-    }
-
-    // IFUNC always needs to be fixed up by the dynamic linker.
-    if (sym->get_type() == STT_GNU_IFUNC) {
-      u64 resolver_addr = sym->get_addr(ctx, false);
-      *rel++ = reloc<E>(addr, E::R_IRELATIVE, 0, resolver_addr);
-      buf[sym->get_got_idx(ctx)] = resolver_addr;
-      continue;
-    }
-
-    // If we know the address at address at link-time, fill that GOT entry
-    // now. It may need a base relocation, though.
-    buf[sym->get_got_idx(ctx)] = sym->get_addr(ctx);
-    if (ctx.arg.pic && sym->is_relative() && !ctx.arg.pack_dyn_relocs_relr)
-      *rel++ = reloc<E>(addr, E::R_RELATIVE, 0, (i64)sym->get_addr(ctx));
+    if (ent.r_type &&
+        (ent.r_type != E::R_RELATIVE || !ctx.arg.pack_dyn_relocs_relr))
+      *rel++ = reloc<E>(this->shdr.sh_addr + ent.idx * E::word_size, ent.r_type,
+                        ent.sym ? ent.sym->get_dynsym_idx(ctx) : 0, ent.val);
   }
-
-  for (Symbol<E> *sym : tlsgd_syms) {
-    u64 addr = sym->get_tlsgd_addr(ctx);
-    i32 dynsym_idx = sym->get_dynsym_idx(ctx);
-    *rel++ = reloc<E>(addr, E::R_DTPMOD, dynsym_idx);
-    *rel++ = reloc<E>(addr + E::word_size, E::R_DTPOFF, dynsym_idx);
-  }
-
-  if constexpr (E::e_machine != EM_RISCV)
-    for (Symbol<E> *sym : tlsdesc_syms)
-      *rel++ = reloc<E>(sym->get_tlsdesc_addr(ctx), E::R_TLSDESC,
-                        sym->get_dynsym_idx(ctx));
-
-  for (Symbol<E> *sym : gottp_syms) {
-    // If we know nothing about the symbol, let the dynamic linker
-    // to fill the GOT entry.
-    if (sym->is_imported) {
-      *rel++ = reloc<E>(sym->get_gottp_addr(ctx), E::R_TPOFF,
-                        sym->get_dynsym_idx(ctx));
-      continue;
-    }
-
-    // If we know the offset within the current thread vector,
-    // let the dynamic linker to adjust it.
-    if (ctx.arg.shared) {
-      *rel++ = reloc<E>(sym->get_gottp_addr(ctx), E::R_TPOFF, 0,
-                        sym->get_addr(ctx) - ctx.tls_begin);
-      continue;
-    }
-
-    // Otherwise, we know the offset at link-time, so fill the GOT entry.
-    i64 idx = sym->get_gottp_idx(ctx);
-    if (E::tls_offset == -1)
-      buf[idx] = sym->get_addr(ctx) - ctx.tls_end;
-    else
-      buf[idx] = sym->get_addr(ctx) - ctx.tls_begin + E::tls_offset;
-  }
-
-  if (tlsld_idx != -1)
-    *rel++ = reloc<E>(get_tlsld_addr(ctx), E::R_DTPMOD, 0);
 }
 
 template <typename E>
 void GotSection<E>::construct_relr(Context<E> &ctx) {
-  std::vector<typename E::WordTy> pos;
+  assert(ctx.arg.pack_dyn_relocs_relr);
 
-  for (Symbol<E> *sym : got_syms)
-    if (!sym->is_imported && sym->get_type() != STT_GNU_IFUNC &&
-        ctx.arg.pic && sym->is_relative())
-      pos.push_back(sym->get_got_addr(ctx) - this->shdr.sh_addr);
+  std::vector<typename E::WordTy> pos;
+  for (GotEntry<E> &ent : get_entries(ctx))
+    if (ent.r_type == E::R_RELATIVE)
+      pos.push_back(ent.idx * E::word_size);
 
   relr = encode_relr(pos);
 }
@@ -1106,16 +1168,17 @@ void GotPltSection<E>::copy_buf(Context<E> &ctx) {
   buf[2] = 0;
 
   auto get_plt_resolver_addr = [&](Symbol<E> &sym) -> u64 {
-    if constexpr (E::e_machine == EM_AARCH64 || E::e_machine == EM_RISCV)
+    if constexpr (std::is_same_v<E, ARM64> || std::is_same_v<E, ARM32> ||
+                  std::is_same_v<E, RISCV64>)
       return ctx.plt->shdr.sh_addr;
 
-    if constexpr (E::e_machine == EM_X86_64) {
+    if constexpr (std::is_same_v<E, X86_64>) {
       if (ctx.arg.z_ibtplt)
         return ctx.plt->shdr.sh_addr;
       return sym.get_plt_addr(ctx) + 6;
     }
 
-    if constexpr (E::e_machine == EM_386)
+    if constexpr (std::is_same_v<E, I386>)
       return sym.get_plt_addr(ctx) + 6;
     unreachable();
   };
@@ -1128,10 +1191,8 @@ template <typename E>
 void PltSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   assert(!sym->has_plt(ctx));
 
-  if (this->shdr.sh_size == 0) {
+  if (this->shdr.sh_size == 0)
     this->shdr.sh_size = ctx.plt_hdr_size;
-    ctx.gotplt->shdr.sh_size = E::word_size * 3;
-  }
 
   sym->set_plt_idx(ctx, symbols.size());
   this->shdr.sh_size += ctx.plt_size;
@@ -1171,6 +1232,9 @@ void RelPltSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void DynsymSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
+  if (symbols.empty())
+    symbols.resize(1);
+
   if (sym->get_dynsym_idx(ctx) != -1)
     return;
   sym->set_dynsym_idx(ctx, -2);
@@ -1277,10 +1341,7 @@ void DynsymSection<E>::copy_buf(Context<E> &ctx) {
     } else if (sym.file->is_dso || sym.esym().is_undef()) {
       esym.st_shndx = SHN_UNDEF;
       esym.st_size = 0;
-      if (sym.has_plt(ctx) && !ctx.arg.pic && sym.is_imported) {
-        // Emit an address for a canonical PLT
-        esym.st_value = sym.get_plt_addr(ctx);
-      }
+      esym.st_value = sym.is_canonical ? sym.get_plt_addr(ctx) : 0;
     } else {
       InputSection<E> *isec = sym.get_input_section();
       if (!isec) {
@@ -1562,6 +1623,8 @@ void MergedSection<E>::print_stats(Context<E> &ctx) {
 
 template <typename E>
 void EhFrameSection<E>::construct(Context<E> &ctx) {
+  Timer t(ctx, "eh_frame");
+
   // Remove dead FDEs and assign them offsets within their corresponding
   // CIE group.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
@@ -2045,6 +2108,502 @@ void NotePropertySection<E>::copy_buf(Context<E> &ctx) {
   buf[6] = features;                       // Feature flags
 }
 
+// .gdb_index section is an optional section to speed up GNU debugger.
+// It contains two maps: 1) a map from function/variable/type names to
+// compunits, and 2) a map from function address ranges to compunits.
+// gdb uses these maps to quickly find a compunit given a name or an
+// instruction pointer.
+//
+// .gdb_index is not mandatory. All the information in .gdb_index is
+// also in other debug info sections. You can actually create an
+// executable without .gdb_index and later add that using
+// `gdb-add-index` post-processing tool that comes with gdb.
+//
+// (Terminology: a compilation unit, which often abbreviated as compunit
+// or cu, is a unit of debug info. An input .debug_info section usually
+// contains one compunit, and thus an output .debug_info contains as
+// many compunits as the number of input files.)
+//
+// The mapping from names to compunits is 1:n while the mapping from
+// address ranges to compunits is 1:1. That is, two object files may
+// define the same type name (with the same definition), while there
+// should be no two functions that overlap with each other in memory.
+//
+// .gdb_index contains an on-disk hash table for names, so gdb can
+// lookup names without loading all strings into memory and construct an
+// in-memory hash table.
+//
+// Names are in .debug_gnu_pubnames and .debug_gnu_pubtypes input
+// sections. These sections are created if `-ggnu-pubnames` is given.
+// Besides names, these sections contains attributes for each name so
+// that gdb can distinguish type names from function names, for example.
+//
+// Function address ranges are in .debug_info and .debug_ranges
+// sections. If an object file is compiled without -ffunction-sections,
+// there's only one .text section in that object file, and in that case
+// its address range is directly stored to .debug_info. If an object
+// file is compiled with -ffunction-sections, it contains multiple .text
+// sections, and address ranges for them are stored to .debug_ranges.
+//
+// .debug_info section contains DWARF debug info. Although we don't need
+// to parse the whole .debug_info section to read address ranges, we
+// have to do a little bit. DWARF is complicated and often handled using
+// a library such as libdwarf. But we don't use any library because we
+// didn't want to add an extra run-time dependency just for --gdb-index.
+//
+// This page explains the format of .gdb_index:
+// https://sourceware.org/gdb/onlinedocs/gdb/Index-Section-Format.html
+template <typename E>
+void GdbIndexSection<E>::construct(Context<E> &ctx) {
+  Timer t(ctx, "GdbIndexSection::construct");
+
+  // Read debug sections
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (file->debug_info == nullptr)
+      return;
+
+    // Read compilation units from .debug_info.
+    file->compunits = read_compunits(ctx, *file);
+
+    // Initialize `num_areas`. Each CU contains zero or one address area.
+    file->num_areas = file->compunits.size();
+
+    // Optionally, a CU can refer an address area list in .debug_ranges.
+    // .debug_ranges contains a vector of [begin, end) address pairs.
+    // The last entry must be a null terminator, so we do -1.
+    if (file->debug_ranges)
+      file->num_areas += file->debug_ranges->sh_size / E::word_size / 2 - 1;
+  });
+
+  // Initialize `area_offset` and `compunits_idx`.
+  for (i64 i = 0; i < ctx.objs.size() - 1; i++) {
+    ctx.objs[i + 1]->area_offset =
+      ctx.objs[i]->area_offset + ctx.objs[i]->num_areas * 20;
+    ctx.objs[i + 1]->compunits_idx =
+      ctx.objs[i]->compunits_idx + ctx.objs[i]->compunits.size();
+  }
+
+  // Read .debug_gnu_pubnames and .debug_gnu_pubtypes.
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    file->pubnames = read_pubnames(ctx, *file);
+  });
+
+  // Estimate the unique number of pubnames.
+  HyperLogLog estimator;
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    HyperLogLog e;
+    for (GdbIndexName &name : file->pubnames)
+      e.insert(name.hash);
+    estimator.merge(e);
+  });
+
+  // Uniquify pubnames by inserting all name strings into a concurrent
+  // hashmap.
+  map.resize(estimator.get_cardinality() * 2);
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (GdbIndexName &name : file->pubnames) {
+      MapEntry *ent = map.insert(name.name, name.hash, {name.hash}).first;
+      ent->num_attrs++;
+      name.entry_idx = ent - map.values;
+    }
+  });
+
+  // Assign in-shard output offsets to names and attrs.
+  std::vector<u32> attr_sizes(map.NUM_SHARDS);
+  std::vector<u32> name_sizes(map.NUM_SHARDS);
+  const i64 shard_size = map.nbuckets / map.NUM_SHARDS;
+  std::atomic_uint32_t num_names = 0;
+
+  tbb::parallel_for((i64)0, (i64)map.NUM_SHARDS, [&](i64 i) {
+    i64 attr_offset = 0;
+    i64 name_offset = 0;
+    i64 count = 0;
+
+    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++) {
+      if (map.keys[j]) {
+        map.values[j].name_offset = name_offset;
+        map.values[j].attr_offset = attr_offset;
+        attr_offset += (map.values[j].num_attrs + 1) * 4;
+        name_offset += map.key_sizes[j] + 1;
+        count++;
+      }
+    }
+
+    attr_sizes[i] = attr_offset;
+    name_sizes[i] = name_offset;
+    num_names += count;
+  });
+
+  // Fix name and attr offsets so that they are relative to
+  // `const_pool_offset`.
+  std::vector<u32> attr_offsets(map.NUM_SHARDS + 1);
+  for (i64 i = 0; i < map.NUM_SHARDS; i++)
+    attr_offsets[i + 1] = attr_offsets[i] + attr_sizes[i];
+  attrs_size = attr_offsets.back();
+
+  std::vector<u32> name_offsets(map.NUM_SHARDS + 1);
+  name_offsets[0] = attrs_size;
+  for (i64 i = 0; i < map.NUM_SHARDS; i++)
+    name_offsets[i + 1] = name_offsets[i] + name_sizes[i];
+
+  tbb::parallel_for((i64)0, (i64)map.NUM_SHARDS, [&](i64 i) {
+    for (i64 j = shard_size * i; j < shard_size * (i + 1); j++) {
+      if (map.keys[j]) {
+        map.values[j].attr_offset += attr_offsets[i];
+        map.values[j].name_offset += name_offsets[i];
+      }
+    }
+  });
+
+  // .gdb_index contains an on-disk hash table for pubnames and
+  // pubtypes. We aim 75% utilization. As per the format specification,
+  // It must be a power of two.
+  num_symtab_entries = std::max<i64>(next_power_of_two(num_names * 4 / 3), 16);
+
+  // Now that we can compute the size of this section.
+  ObjectFile<E> &last = *ctx.objs.back();
+  i64 compunits_size = (last.compunits_idx + last.compunits.size()) * 16;
+  i64 areas_size = last.area_offset + last.num_areas * 20;
+  i64 offset = sizeof(header);
+
+  header.cu_list_offset = offset;
+  offset += compunits_size;
+
+  header.cu_types_offset = offset;
+  header.areas_offset = offset;
+  offset += areas_size;
+
+  header.symtab_offset = offset;
+  offset += num_symtab_entries * 8;
+
+  header.const_pool_offset = offset;
+  offset += name_offsets.back();
+
+  this->shdr.sh_size = offset;
+}
+
+template <typename E>
+void GdbIndexSection<E>::copy_buf(Context<E> &ctx) {
+  u8 *buf = ctx.buf + this->shdr.sh_offset;
+
+  // Write section header.
+  memcpy(buf, &header, sizeof(header));
+  buf += sizeof(header);
+
+  // Write compilation unit list.
+  for (ObjectFile<E> *file : ctx.objs) {
+    if (file->debug_info) {
+      u64 offset = file->debug_info->offset;
+      for (std::string_view cu : file->compunits) {
+        *(u64 *)buf = offset;
+        *(u64 *)(buf + 8) = cu.size();
+        buf += 16;
+        offset += cu.size();
+      }
+    }
+  }
+
+  // Skip address areas. It'll be filled by write_address_areas.
+  buf += header.symtab_offset - header.areas_offset;
+
+  // Write symbol table.
+  memset(buf, 0, num_symtab_entries * 8);
+
+  assert(std::popcount<u64>(num_symtab_entries) == 1);
+  u32 mask = num_symtab_entries - 1;
+
+  for (i64 i = 0; i < map.nbuckets; i++) {
+    if (map.has_key(i)) {
+      u32 hash = map.values[i].hash;
+      u32 step = ((hash * 17) & mask) | 1;
+      u32 j = hash & mask;
+
+      while (*(u32 *)(buf + j * 8))
+        j = (j + step) & mask;
+
+      *(u32 *)(buf + j * 8) = map.values[i].name_offset;
+      *(u32 *)(buf + j * 8 + 4) = map.values[i].attr_offset;
+    }
+  }
+
+  buf += num_symtab_entries * 8;
+
+  // Write CU vector
+  memset(buf, 0, attrs_size);
+  std::atomic_uint32_t *attrs = (std::atomic_uint32_t *)buf;
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (GdbIndexName &name : file->pubnames) {
+      MapEntry &ent = map.values[name.entry_idx];
+      u32 idx = ent.attr_offset / 4;
+      attrs[idx + ++attrs[idx]] = name.attr;
+    }
+  });
+
+  // Write pubnames and pubtypes.
+  tbb::parallel_for((i64)0, (i64)map.nbuckets, [&](i64 i) {
+    if (map.has_key(i)) {
+      std::string_view name{map.keys[i], map.key_sizes[i]};
+      write_string(buf + map.values[i].name_offset, name);
+    }
+  });
+}
+
+template <typename E>
+void GdbIndexSection<E>::write_address_areas(Context<E> &ctx) {
+  Timer t(ctx, "GdbIndexSection::write_address_areas");
+  u8 *base = ctx.buf + this->shdr.sh_offset;
+
+  struct __attribute__((packed)) Entry {
+    u64 start;
+    u64 end;
+    u32 attr;
+  };
+
+  // Read .debug_info and .debug_ranges to copy address ranges
+  // to .gdb_index.
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (!file->debug_info)
+      return;
+
+    Entry *begin = (Entry *)(base + header.areas_offset + file->area_offset);
+    Entry *e = begin;
+    u64 offset = file->debug_info->offset;
+
+    for (i64 i = 0; i < file->compunits.size(); i++) {
+      std::vector<u64> addrs = read_address_areas(ctx, *file, offset);
+
+      for (i64 j = 0; j < addrs.size(); j += 2) {
+        // Skip an address area for a dead function
+        if (addrs[j] == 1 && addrs[j + 1] == 1)
+          continue;
+
+        e->start = addrs[j];
+        e->end = addrs[j + 1];
+        e->attr = file->compunits_idx + i;
+        e++;
+      }
+      offset += file->compunits[i].size();
+    }
+
+    // Fill trailing null entries with dummy values because gdb
+    // crashes if there are entries with address 0.
+    u64 filler = (e == begin) ? ctx.etext->get_addr(ctx) - 1 : e[-1].start;
+    for (; e < begin + file->num_areas; e++)
+      e->start = e->end = filler;
+  });
+}
+
+// Returns the list of compilation units in .gdb_index. A .gdb_index
+// usually contains only one compilatation unit unless the object was
+// built by `ld -r`.
+template <typename E>
+std::vector<std::string_view>
+GdbIndexSection<E>::read_compunits(Context<E> &ctx, ObjectFile<E> &file) {
+  std::string_view data = file.debug_info->contents;
+  std::vector<std::string_view> vec;
+
+  while (!data.empty()) {
+    if (data.size() < 4)
+      Fatal(ctx) << *file.debug_info << ": corrupted .debug_info";
+    i64 len = *(u32 *)data.data() + 4;
+    vec.push_back(data.substr(0, len));
+    data = data.substr(len);
+  }
+  return vec;
+}
+
+// Parses .debug_gnu_pubnames and .debug_gnu_pubtypes. These sections
+// start with a 14 bytes header followed by (4-byte offset, 1-byte type,
+// null-terminated string) tuples.
+//
+// The 4-byte offset is an offset into .debug_info that contains details
+// about the name. The 1-byte type is a type of the corresponding name
+// (e.g. function, variable or datatype). The string is a name of a
+// function, a variable or a type.
+template <typename E>
+std::vector<GdbIndexName>
+GdbIndexSection<E>::read_pubnames(Context<E> &ctx, ObjectFile<E> &file) {
+  std::vector<GdbIndexName> vec;
+
+  auto get_cu_idx = [&](InputSection<E> &isec, i64 offset) {
+    i64 off = 0;
+    for (i64 i = 0; i < file.compunits.size(); i++) {
+      if (offset == off)
+        return file.compunits_idx + i;
+      off += file.compunits[i].size();
+    }
+    Fatal(ctx) << isec << ": corrupted debug_info_offset";
+  };
+
+  auto read = [&](InputSection<E> &isec) {
+    std::string_view contents = isec.contents;
+
+    while (!contents.empty()) {
+      if (contents.size() < 14)
+        Fatal(ctx) << isec << ": corrupted header";
+
+      u32 len = *(u32 *)contents.data() + 4;
+      u32 debug_info_offset = *(u32 *)(contents.data() + 6);
+      u32 cu_idx = get_cu_idx(isec, debug_info_offset);
+
+      std::string_view data = contents.substr(14, len - 14);
+      contents = contents.substr(len);
+
+      while (!data.empty()) {
+        u32 offset = *(u32 *)data.data();
+        data = data.substr(4);
+        if (offset == 0)
+          break;
+
+        u8 type = data[0];
+        data = data.substr(1);
+
+        std::string_view name = data.data();
+        data = data.substr(name.size() + 1);
+
+        vec.push_back({name, gdb_hash(name), offset + debug_info_offset,
+                       (type << 24) | cu_idx});
+      }
+    }
+  };
+
+  if (file.debug_pubnames)
+    read(*file.debug_pubnames);
+  if (file.debug_pubtypes)
+    read(*file.debug_pubtypes);
+  return vec;
+}
+
+// Returns a list of address ranges explained by a compunit at the
+// `offset` in an output .debug_info section.
+//
+// .debug_info contains DWARF debug info records, so this function
+// parses DWARF. If a designated compunit contains multiple ranges, the
+// ranges are read from .debug_ranges. Otherwise, a range is read
+// directly from .debug_info.
+template <typename E>
+std::vector<u64>
+GdbIndexSection<E>::read_address_areas(Context<E> &ctx, ObjectFile<E> &file,
+                                       i64 offset) {
+  OutputSection<E> *debug_info = nullptr;
+  OutputSection<E> *debug_abbrev = nullptr;
+  OutputSection<E> *debug_ranges = nullptr;
+
+  for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections) {
+    if (osec->name == ".debug_info")
+      debug_info = osec.get();
+    if (osec->name == ".debug_abbrev")
+      debug_abbrev = osec.get();
+    if (osec->name == ".debug_ranges")
+      debug_ranges = osec.get();
+  }
+
+  assert(debug_info);
+  assert(debug_abbrev);
+
+  // Read .debug_abbrev to learn the format of .debug_info.
+  u8 *cu = (u8 *)(ctx.buf + debug_info->shdr.sh_offset + offset);
+  u32 abbrev_offset = *(u32 *)(cu + 6);
+  cu += 11;
+  read_uleb(cu); // skip abbrev code
+
+  u8 *abbrev = (u8 *)(ctx.buf + debug_abbrev->shdr.sh_offset + abbrev_offset);
+  read_uleb(abbrev); // skip abbrev code
+  u64 abbrev_tag = read_uleb(abbrev);
+
+  if (abbrev_tag != DW_TAG_compile_unit)
+    Error(ctx) << file << ": --gdb-index: .debug_abbrev does not contain"
+               << " DW_TAG_compile_unit";
+
+  abbrev++; // skip has_children byte
+
+  std::optional<u64> low_pc;
+
+  for (;;) {
+    u64 name = read_uleb(abbrev);
+    u64 form = read_uleb(abbrev);
+    if (name == 0 && form == 0)
+      break;
+
+    auto read_value = [&]() -> u64 {
+      switch (form) {
+      case DW_FORM_flag_present:
+        return 0;
+      case DW_FORM_data1:
+      case DW_FORM_flag:
+        return *cu++;
+      case DW_FORM_data2: {
+        u64 val = *(u16 *)cu;
+        cu += 2;
+        return val;
+      }
+      case DW_FORM_data4:
+      case DW_FORM_strp:
+      case DW_FORM_sec_offset: {
+        u64 val = *(u32 *)cu;
+        cu += 4;
+        return val;
+      }
+      case DW_FORM_data8: {
+        u64 val = *(u64 *)cu;
+        cu += 8;
+        return val;
+      }
+      case DW_FORM_addr: {
+        u64 val = *(typename E::WordTy *)cu;
+        cu += E::word_size;
+        return val;
+      }
+      case DW_FORM_string: {
+        while (*cu)
+          cu++;
+        cu++;
+        return 0;
+      }
+      default:
+        Error(ctx) << file << ": --gdb-index: unknown debug info form: 0x"
+                   << std::hex << form;
+        return 0;
+      }
+    };
+
+    switch (name) {
+    case DW_AT_low_pc:
+      *low_pc = read_value();
+      break;
+    case DW_AT_high_pc:
+      if (low_pc)
+        Error(ctx) << file << ": --gdb-index: missing DW_AT_low_pc";
+
+      if (form == DW_FORM_addr)
+        return {*low_pc, read_value()};
+      return {*low_pc, *low_pc + read_value()};
+    case DW_AT_ranges: {
+      if (!debug_ranges)
+        Fatal(ctx) << file << ": --gdb-index: .missing debug_ranges";
+
+      u64 offset = read_value();
+      typename E::WordTy *range =
+        (typename E::WordTy *)(ctx.buf + debug_ranges->shdr.sh_offset + offset);
+
+      std::vector<u64> vec;
+      for (i64 i = 0; range[i] || range[i + 1]; i += 2) {
+        vec.push_back(range[i]);
+        vec.push_back(range[i + 1]);
+      }
+      return vec;
+    }
+    default:
+      read_value();
+      break;
+    }
+  }
+
+  return {};
+}
+
 template <typename E>
 GabiCompressedSection<E>::GabiCompressedSection(Context<E> &ctx,
                                                 Chunk<E> &chunk) {
@@ -2207,6 +2766,7 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
   template class VerdefSection<E>;                                      \
   template class BuildIdSection<E>;                                     \
   template class NotePropertySection<E>;                                \
+  template class GdbIndexSection<E>;                                    \
   template class GabiCompressedSection<E>;                              \
   template class GnuCompressedSection<E>;                               \
   template class RelocSection<E>;                                       \
